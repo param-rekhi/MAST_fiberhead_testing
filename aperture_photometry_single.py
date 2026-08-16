@@ -45,8 +45,8 @@ SATURATION_ADU = 1023  # 10-bit sensor
 # Measurement defaults.
 DEFAULT_FWHM_GUESS = 11.0  # pixels
 DEFAULT_K_FWHM = 2.5  # aperture radius in units of the measured FWHM
-ANNULUS_IN_FWHM = 9.0
-ANNULUS_OUT_FWHM = 14.0
+ANNULUS_IN_FWHM = 4.0
+ANNULUS_OUT_FWHM = 7.0
 DEFAULT_NSIGMA = 5.0
 SIGMA_CLIP = 3.0
 
