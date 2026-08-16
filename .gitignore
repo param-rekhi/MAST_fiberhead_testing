@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Raw image data (large binaries kept out of version control)
+data/**
+!data/**/
+!data/**/.gitkeep
+
+# Generated outputs
+results/**
+!results/**/
+!results/**/.gitkeep
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/
