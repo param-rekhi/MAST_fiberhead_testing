@@ -5,8 +5,10 @@ Locates the one bright spot in a TIFF frame, measures its FWHM, subtracts a
 background estimated either globally or from a local annulus, and integrates the
 counts inside a circular aperture whose radius is scaled to the measured FWHM.
 
-Outputs a two-panel diagnostic figure (annotated cutout + curve of growth), a row
-in a CSV table of measurements, and a summary printed to stdout.
+Outputs a row in a CSV table of measurements (see --outfile), a summary printed
+to stdout, and a two-panel diagnostic figure (annotated cutout + curve of growth)
+written to `plots/`. The figures are throwaway sanity checks, so their location
+is fixed and untracked; --no-plot skips them entirely.
 
 Any number of frames can be measured in one invocation, given as files, as
 directories (whose top-level TIFFs are measured), or as a text file listing
@@ -33,7 +35,6 @@ import tifffile
 from astropy.convolution import Gaussian2DKernel, convolve
 from astropy.nddata import Cutout2D
 from astropy.stats import SigmaClip
-from astropy.visualization import ZScaleInterval
 from photutils.aperture import (
     ApertureStats,
     CircularAnnulus,
@@ -60,7 +61,11 @@ SIGMA_CLIP = 3.0
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
-CSV_NAME = "aperture_photometry_single.csv"
+# Output locations. Diagnostic figures are throwaway sanity checks, so they
+# always land in PLOT_DIR rather than anywhere the user chooses.
+RESULTS_DIR = Path("results")
+PLOT_DIR = Path("plots")
+DEFAULT_OUTFILE = RESULTS_DIR / "aperture_photometry_single.csv"
 CSV_COLUMNS = [
     "filename",
     "x",
@@ -476,7 +481,10 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=No
     """Save (and optionally display) the cutout and curve-of-growth diagnostic.
 
     The cutout axes are shifted so that the source centroid sits at (0, 0), i.e.
-    the tick labels give the offset from the source in pixels.
+    the tick labels give the offset from the source in pixels. pyplot and
+    ZScaleInterval are imported here rather than at module scope so that a
+    --no-plot run, which never calls this function, does not import matplotlib at
+    all - astropy.visualization pulls matplotlib in as a side effect.
 
     Parameters
     ----------
@@ -503,6 +511,7 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=No
         The path the figure was written to.
     """
     import matplotlib.pyplot as plt
+    from astropy.visualization import ZScaleInterval
 
     radius = aperture.r
     hwhm = fwhm / 2.0
@@ -563,13 +572,18 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=No
 
 
 def update_csv(csv_path, rows):
-    """Write measurements to the results CSV, superseding any earlier ones.
+    """Write measurements to the results CSV, keeping one row per image.
 
-    Existing rows referring to the same images are dropped and the new
-    measurements appended at the bottom, so the table holds exactly one current
-    result per file in the order it was last measured. Filenames are compared as
-    resolved paths, so different spellings of the same file still match. The
-    table is rewritten via a temporary file and an atomic replace, so an
+    The existing table and the new measurements are concatenated, then only the
+    last row for each image is kept, so a re-measured frame moves to the bottom
+    and any duplicates already sitting in the table collapse too, whether or not
+    this run touched them. Filenames are compared as resolved paths, so different
+    spellings of the same file still match. Deduplication keeps the last
+    occurrence by index rather than assigning into a dict keyed by filename,
+    because reassigning a dict key preserves its original position and would
+    leave re-measured frames where they were.
+
+    The table is written once, via a temporary file and an atomic replace, so an
     interrupted run cannot leave it truncated. Called once per invocation rather
     than once per frame, both to avoid rewriting the table N times and so that a
     failed batch does not leave it half updated.
@@ -584,7 +598,8 @@ def update_csv(csv_path, rows):
     Returns
     -------
     tuple
-        (path, n_replaced) where `n_replaced` is the number of superseded rows.
+        (path, n_removed) where `n_removed` is the number of superseded rows
+        dropped from the table.
     """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -595,17 +610,15 @@ def update_csv(csv_path, rows):
         except OSError:
             return str(name)
 
-    new_keys = {key(row["filename"]) for row in rows}
-    kept = []
-    n_replaced = 0
-
+    existing = []
     if csv_path.exists():
         with csv_path.open(newline="") as handle:
-            for existing in csv.DictReader(handle):
-                if key(existing.get("filename", "")) in new_keys:
-                    n_replaced += 1
-                else:
-                    kept.append(existing)
+            existing = list(csv.DictReader(handle))
+
+    combined = existing + list(rows)
+    last_index = {key(row.get("filename", "")): i for i, row in enumerate(combined)}
+    kept = [row for i, row in enumerate(combined)
+            if last_index[key(row.get("filename", ""))] == i]
 
     tmp_path = csv_path.with_suffix(csv_path.suffix + ".tmp")
     with tmp_path.open("w", newline="") as handle:
@@ -613,10 +626,34 @@ def update_csv(csv_path, rows):
                                 extrasaction="ignore")
         writer.writeheader()
         writer.writerows(kept)
-        writer.writerows(rows)
     tmp_path.replace(csv_path)
 
-    return csv_path, n_replaced
+    return csv_path, len(combined) - len(kept)
+
+
+def resolve_outfile(outfile):
+    """Resolve the --outfile value to the CSV path to write.
+
+    A value carrying a directory component is used exactly as given, absolute or
+    relative; a bare filename is placed inside `RESULTS_DIR`, so `run01.csv`
+    means `results/run01.csv`.
+
+    Note that pathlib normalises `./run01.csv` to `run01.csv`, which therefore
+    still lands in `results/`. Writing to the current working directory needs an
+    explicit absolute path.
+
+    Parameters
+    ----------
+    outfile : str or pathlib.Path
+        The value given to --outfile.
+
+    Returns
+    -------
+    pathlib.Path
+        The CSV path to write to.
+    """
+    path = Path(outfile)
+    return path if path.parent != Path(".") else RESULTS_DIR / path.name
 
 
 def parse_args(argv=None):
@@ -660,15 +697,24 @@ def parse_args(argv=None):
                         help="RMS read noise in e-")
     parser.add_argument("--plane", type=int, default=0,
                         help="page to use from a multi-page TIFF")
-    parser.add_argument("--outdir", type=Path, default=Path("results"),
-                        help="directory for the figure and CSV")
+    parser.add_argument("--outfile", type=Path, default=DEFAULT_OUTFILE,
+                        help=f"CSV file to write. A value with a directory component "
+                             f"is used as given (--outfile runs/run01.csv, --outfile "
+                             f"/data/x.csv); a bare filename goes inside "
+                             f"{RESULTS_DIR}/, so --outfile run01.csv writes "
+                             f"{RESULTS_DIR}/run01.csv. Note that ./run01.csv "
+                             f"normalises to run01.csv and so also lands in "
+                             f"{RESULTS_DIR}/ - use an absolute path to write to the "
+                             f"current directory. Diagnostic figures are not affected: "
+                             f"they always go to {PLOT_DIR}/")
     parser.add_argument("--no-plot", action="store_true",
-                        help="do not open the interactive figure window (the PNG is "
-                             "still written to --outdir; windows are suppressed "
-                             "automatically when measuring more than one frame)")
-    parser.add_argument("--no-figure", action="store_true",
-                        help="skip the diagnostic figure entirely, saving ~0.3 s "
-                             "per frame")
+                        help=f"skip the diagnostic figure entirely - nothing displayed "
+                             f"and nothing written to {PLOT_DIR}/. Saves ~0.15 s per "
+                             f"frame plus a one-off ~0.3 s of pyplot import, or ~1.4 s "
+                             f"for a single frame, where displaying the window also "
+                             f"starts an interactive backend. Windows are suppressed "
+                             f"automatically when measuring more than one frame, but "
+                             f"the PNGs are still written")
     parser.add_argument("--no-csv", action="store_true",
                         help="do not write results to the CSV table")
 
@@ -677,6 +723,9 @@ def parse_args(argv=None):
 
 def measure_frame(image_path, args, show=False):
     """Measure one frame and report the result to stdout.
+
+    Unless --no-plot was given, the diagnostic figure is written to
+    `PLOT_DIR/<stem>_aperture.png`.
 
     Parameters
     ----------
@@ -738,8 +787,8 @@ def measure_frame(image_path, args, show=False):
         print(f"WARNING: {result['n_saturated']} saturated pixels (>= {SATURATION_ADU} "
               "counts) inside the aperture - the measured counts are a lower limit.")
 
-    if not args.no_figure:
-        figure_path = args.outdir / f"{image_path.stem}_aperture.png"
+    if not args.no_plot:
+        figure_path = PLOT_DIR / f"{image_path.stem}_aperture.png"
         make_figure(data, position, result["aperture"], fwhm, bkg_median, figure_path,
                     annulus=annulus, show=show)
         print(f"figure      : {figure_path}")
@@ -766,8 +815,9 @@ def main(argv=None):
     """Measure every requested frame and write the results.
 
     A frame that cannot be read or has no detectable source is reported and
-    skipped, so one bad file does not abandon a batch. The CSV is written once,
-    after all frames are measured.
+    skipped, so one bad file does not abandon a batch. The CSV named by --outfile
+    is written once, after all frames are measured; diagnostic figures go to
+    `PLOT_DIR`.
 
     Parameters
     ----------
@@ -787,10 +837,11 @@ def main(argv=None):
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # An interactive window per frame is unusable in a batch, and a headless
-    # backend is needed as soon as nothing is displayed at all.
-    show = not args.no_plot and not args.no_figure and len(frames) == 1
-    if not show:
+    # An interactive window per frame is unusable in a batch, so figures are only
+    # displayed for a single frame; a headless backend is needed when they are
+    # saved without being shown. With --no-plot matplotlib is never imported.
+    show = not args.no_plot and len(frames) == 1
+    if not args.no_plot and not show:
         import matplotlib
         matplotlib.use("Agg")
 
@@ -808,10 +859,10 @@ def main(argv=None):
             print(f"ERROR: {frame}: {exc.__class__.__name__}: {exc}", file=sys.stderr)
 
     if rows and not args.no_csv:
-        csv_path, n_replaced = update_csv(args.outdir / CSV_NAME, rows)
-        superseded = f" (replaced {n_replaced} earlier row"
-        superseded += "s)" if n_replaced > 1 else ")"
-        print(f"\ncsv         : {csv_path}{superseded if n_replaced else ''}")
+        csv_path, n_removed = update_csv(resolve_outfile(args.outfile), rows)
+        removed = f" (removed {n_removed} superseded row"
+        removed += "s)" if n_removed > 1 else ")"
+        print(f"\ncsv         : {csv_path}{removed if n_removed else ''}")
 
     if len(frames) > 1 or failures:
         print(f"measured {len(rows)}/{len(frames)} frames"

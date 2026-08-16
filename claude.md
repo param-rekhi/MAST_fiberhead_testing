@@ -11,6 +11,7 @@ This will grow into a small toolkit to conduct photometry on images of the fiber
 ## Data and results
 - Raw data lives in subdirectories in `data/`
 - Any saved outputs go in `results/` when applicable
+- Plots are currently only for sanity check and are saved temporarily in `plots/`. This folder is not tracked by git.
 
 ## Tools to use
 - Python, with photutils, astropy, numpy, matplotlib, tifffile

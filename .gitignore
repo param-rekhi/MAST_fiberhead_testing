@@ -17,6 +17,9 @@ results/**
 !results/**/
 !results/**/.gitkeep
 
+# Throwaway diagnostic figures
+plots/
+
 # Editor / OS
 .DS_Store
 *.swp
