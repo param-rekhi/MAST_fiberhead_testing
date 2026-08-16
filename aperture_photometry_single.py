@@ -427,8 +427,15 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=No
     return out_path
 
 
-def append_csv(csv_path, row):
-    """Append one measurement to the results CSV, writing a header if needed.
+def update_csv(csv_path, row):
+    """Write one measurement to the results CSV, superseding any earlier one.
+
+    Rows referring to the same image are dropped and the new measurement is
+    appended at the bottom, so the table holds exactly one current result per
+    file in the order it was last measured. Filenames are compared as resolved
+    paths, so different spellings of the same file still match. The table is
+    rewritten via a temporary file and an atomic replace, so an interrupted run
+    cannot leave it truncated.
 
     Parameters
     ----------
@@ -439,19 +446,40 @@ def append_csv(csv_path, row):
 
     Returns
     -------
-    pathlib.Path
-        The path the row was written to.
+    tuple
+        (path, n_replaced) where `n_replaced` is the number of superseded rows.
     """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    new_file = not csv_path.exists()
 
-    with csv_path.open("a", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
-        if new_file:
-            writer.writeheader()
+    def key(name):
+        """Return a comparable form of a filename, resolving it where possible."""
+        try:
+            return str(Path(name).resolve())
+        except OSError:
+            return str(name)
+
+    new_key = key(row["filename"])
+    kept = []
+    n_replaced = 0
+
+    if csv_path.exists():
+        with csv_path.open(newline="") as handle:
+            for existing in csv.DictReader(handle):
+                if key(existing.get("filename", "")) == new_key:
+                    n_replaced += 1
+                else:
+                    kept.append(existing)
+
+    tmp_path = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    with tmp_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, restval="",
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(kept)
         writer.writerow(row)
+    tmp_path.replace(csv_path)
 
-    return csv_path
+    return csv_path, n_replaced
 
 
 def parse_args(argv=None):
@@ -575,7 +603,7 @@ def main(argv=None):
     print(f"figure      : {figure_path}")
 
     if not args.no_csv:
-        csv_path = append_csv(args.outdir / CSV_NAME, {
+        csv_path, n_replaced = update_csv(args.outdir / CSV_NAME, {
             "filename": str(args.image),
             "x": f"{position[0]:.3f}",
             "y": f"{position[1]:.3f}",
@@ -591,7 +619,9 @@ def main(argv=None):
             "gain": args.gain,
             "read_noise_e": args.read_noise,
         })
-        print(f"csv         : {csv_path}")
+        superseded = f" (replaced {n_replaced} earlier row"
+        superseded += "s)" if n_replaced > 1 else ")"
+        print(f"csv         : {csv_path}{superseded if n_replaced else ''}")
 
     return 0
 
