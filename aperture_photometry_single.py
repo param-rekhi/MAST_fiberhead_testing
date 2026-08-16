@@ -44,7 +44,7 @@ SATURATION_ADU = 1023  # 10-bit sensor
 
 # Measurement defaults.
 DEFAULT_FWHM_GUESS = 11.0  # pixels
-DEFAULT_K_FWHM = 5.0  # aperture radius in units of the measured FWHM
+DEFAULT_K_FWHM = 2.5  # aperture radius in units of the measured FWHM
 ANNULUS_IN_FWHM = 9.0
 ANNULUS_OUT_FWHM = 14.0
 DEFAULT_NSIGMA = 5.0
@@ -336,8 +336,12 @@ def measure_counts(data, position, radius, bkg_median, bkg_std, n_bkg_pix,
     }
 
 
-def make_figure(data, position, aperture, bkg_median, out_path, annulus=None, show=True):
+def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=None,
+                show=True):
     """Save (and optionally display) the cutout and curve-of-growth diagnostic.
+
+    The cutout axes are shifted so that the source centroid sits at (0, 0), i.e.
+    the tick labels give the offset from the source in pixels.
 
     Parameters
     ----------
@@ -347,6 +351,8 @@ def make_figure(data, position, aperture, bkg_median, out_path, annulus=None, sh
         The (x, y) source centroid.
     aperture : photutils.aperture.CircularAperture
         The measurement aperture.
+    fwhm : float
+        Measured source FWHM in pixels; drawn as a circle of radius FWHM / 2.
     bkg_median : float
         Background level per pixel, subtracted before building the growth curve.
     out_path : pathlib.Path
@@ -364,31 +370,47 @@ def make_figure(data, position, aperture, bkg_median, out_path, annulus=None, sh
     import matplotlib.pyplot as plt
 
     radius = aperture.r
-    size = int(np.ceil(6 * radius))
+    hwhm = fwhm / 2.0
+
+    half_size = 3.0 * radius
+    if annulus is not None:
+        half_size = max(half_size, 1.1 * annulus.r_out)
+    size = int(np.ceil(2 * half_size))
+
     cutout = Cutout2D(data, position, size, mode="partial", fill_value=np.nan)
     xcut, ycut = cutout.to_cutout_position(position)
+
+    ny, nx = cutout.data.shape
+    extent = [-xcut - 0.5, nx - xcut - 0.5, -ycut - 0.5, ny - ycut - 0.5]
 
     fig, (ax_img, ax_cog) = plt.subplots(1, 2, figsize=(11, 4.6))
 
     vmin, vmax = ZScaleInterval().get_limits(cutout.data[np.isfinite(cutout.data)])
-    ax_img.imshow(cutout.data, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
-    CircularAperture((xcut, ycut), r=radius).plot(
+    ax_img.imshow(cutout.data, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax,
+                  extent=extent)
+    CircularAperture((0.0, 0.0), r=radius).plot(
         ax=ax_img, color="white", lw=1.5, label=f"aperture r = {radius:.1f} px"
     )
+    CircularAperture((0.0, 0.0), r=hwhm).plot(
+        ax=ax_img, color="deepskyblue", lw=1.2, label=f"HWHM r = {hwhm:.1f} px"
+    )
     if annulus is not None:
-        CircularAnnulus((xcut, ycut), r_in=annulus.r_in, r_out=annulus.r_out).plot(
+        CircularAnnulus((0.0, 0.0), r_in=annulus.r_in, r_out=annulus.r_out).plot(
             ax=ax_img, color="orange", lw=1.0, ls="--", label="background annulus"
         )
-    ax_img.plot(xcut, ycut, "r+", ms=8)
+    ax_img.plot(0.0, 0.0, "r+", ms=8)
+    ax_img.set_xlim(extent[0], extent[1])
+    ax_img.set_ylim(extent[2], extent[3])
     ax_img.set_title(f"source at ({position[0]:.1f}, {position[1]:.1f})")
-    ax_img.set_xlabel("x [px]")
-    ax_img.set_ylabel("y [px]")
+    ax_img.set_xlabel("x offset from source [px]")
+    ax_img.set_ylabel("y offset from source [px]")
     ax_img.legend(loc="upper right", fontsize=8, framealpha=0.6)
 
     radii = np.linspace(1.0, 1.5 * radius, 60)
     cog = CurveOfGrowth(data - bkg_median, position, radii)
     ax_cog.plot(cog.radius, cog.profile, color="k", lw=1.2)
     ax_cog.axvline(radius, color="crimson", ls="--", lw=1.2, label=f"r = {radius:.1f} px")
+    ax_cog.axvline(hwhm, color="deepskyblue", ls=":", lw=1.2, label=f"HWHM = {hwhm:.1f} px")
     ax_cog.set_xlabel("aperture radius [px]")
     ax_cog.set_ylabel("enclosed counts")
     ax_cog.set_title("curve of growth")
@@ -548,7 +570,7 @@ def main(argv=None):
               "counts) inside the aperture - the measured counts are a lower limit.")
 
     figure_path = args.outdir / f"{args.image.stem}_aperture.png"
-    make_figure(data, position, result["aperture"], bkg_median, figure_path,
+    make_figure(data, position, result["aperture"], fwhm, bkg_median, figure_path,
                 annulus=annulus, show=not args.no_plot)
     print(f"figure      : {figure_path}")
 
