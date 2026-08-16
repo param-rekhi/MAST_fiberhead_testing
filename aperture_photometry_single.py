@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Aperture photometry for a single fiber output in a MAST fiberhead image.
+"""Aperture photometry for a single fiber output in MAST fiberhead images.
 
 Locates the one bright spot in a TIFF frame, measures its FWHM, subtracts a
 background estimated either globally or from a local annulus, and integrates the
 counts inside a circular aperture whose radius is scaled to the measured FWHM.
 
 Outputs a two-panel diagnostic figure (annotated cutout + curve of growth), a row
-appended to a CSV table of measurements, and a summary printed to stdout.
+in a CSV table of measurements, and a summary printed to stdout.
 
-Example
--------
+Any number of frames can be measured in one invocation, given as files, as
+directories (whose top-level TIFFs are measured), or as a text file listing
+either of those one per line. Batching this way is worth it: the astropy and
+photutils imports cost ~0.6 s and are paid once per invocation rather than once
+per frame.
+
+Examples
+--------
     python aperture_photometry_single.py data/run01/frame_001.tif
+    python aperture_photometry_single.py data/run01/
+    python aperture_photometry_single.py frames_to_measure.txt
 """
 
 from __future__ import annotations
@@ -24,7 +32,7 @@ import numpy as np
 import tifffile
 from astropy.convolution import Gaussian2DKernel, convolve
 from astropy.nddata import Cutout2D
-from astropy.stats import SigmaClip, sigma_clipped_stats
+from astropy.stats import SigmaClip
 from astropy.visualization import ZScaleInterval
 from photutils.aperture import (
     ApertureStats,
@@ -50,6 +58,8 @@ ANNULUS_OUT_FWHM = 7.0
 DEFAULT_NSIGMA = 5.0
 SIGMA_CLIP = 3.0
 
+TIFF_SUFFIXES = {".tif", ".tiff"}
+
 CSV_NAME = "aperture_photometry_single.csv"
 CSV_COLUMNS = [
     "filename",
@@ -67,6 +77,109 @@ CSV_COLUMNS = [
     "gain",
     "read_noise_e",
 ]
+
+
+def expand_input(entry, allow_list=True):
+    """Expand one command-line entry into the frames it refers to.
+
+    An entry may be a TIFF file, a directory (whose top-level TIFFs are taken,
+    sorted by name, without recursing), or a text file listing files and
+    directories one per line. Blank lines and lines starting with `#` are ignored
+    in a list file, and relative paths in it are resolved against the directory
+    the list itself lives in.
+
+    Parameters
+    ----------
+    entry : str or pathlib.Path
+        The path to expand.
+    allow_list : bool, optional
+        Whether a non-TIFF file may be read as a list of paths. Set False when
+        expanding the contents of a list file, so lists cannot nest.
+
+    Returns
+    -------
+    list of pathlib.Path
+        The frames to measure, in the order they were given.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the entry does not exist.
+    ValueError
+        If a directory holds no TIFFs, or a list file is referenced from inside
+        another list file.
+    """
+    path = Path(entry)
+
+    if not path.exists():
+        msg = f"no such file or directory: {path}"
+        raise FileNotFoundError(msg)
+
+    if path.is_dir():
+        frames = sorted(p for p in path.iterdir()
+                        if p.is_file() and p.suffix.lower() in TIFF_SUFFIXES)
+        if not frames:
+            msg = (f"directory {path} contains no TIFF files (looked for "
+                   f"{', '.join(sorted(TIFF_SUFFIXES))} at the top level only)")
+            raise ValueError(msg)
+        return frames
+
+    if path.suffix.lower() in TIFF_SUFFIXES:
+        return [path]
+
+    if not allow_list:
+        msg = f"{path} is not a TIFF or a directory, and list files cannot nest"
+        raise ValueError(msg)
+
+    frames = []
+    with path.open() as handle:
+        for lineno, line in enumerate(handle, start=1):
+            entry = line.split("#", 1)[0].strip()
+            if not entry:
+                continue
+            listed = Path(entry)
+            if not listed.is_absolute():
+                listed = path.parent / listed
+            try:
+                frames.extend(expand_input(listed, allow_list=False))
+            except (FileNotFoundError, ValueError) as exc:
+                msg = f"{path}:{lineno}: {exc}"
+                raise ValueError(msg) from None
+
+    if not frames:
+        msg = f"list file {path} names no frames"
+        raise ValueError(msg)
+
+    return frames
+
+
+def gather_frames(entries):
+    """Expand all command-line entries into a de-duplicated list of frames.
+
+    Parameters
+    ----------
+    entries : list of str
+        The positional arguments as given on the command line.
+
+    Returns
+    -------
+    list of pathlib.Path
+        Frames to measure, in the order first seen, with repeats removed.
+    """
+    frames = []
+    seen = set()
+
+    for entry in entries:
+        for frame in expand_input(entry):
+            try:
+                key = frame.resolve()
+            except OSError:
+                key = frame
+            if key not in seen:
+                seen.add(key)
+                frames.append(frame)
+
+    return frames
 
 
 def load_image(path, plane=0):
@@ -112,7 +225,30 @@ def load_image(path, plane=0):
     return np.asarray(image, dtype=np.float64)
 
 
-def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA):
+def frame_stats(data):
+    """Return sigma-clipped statistics for the whole frame.
+
+    Computed once per frame and reused for the detection threshold, the profile
+    background and (unless a local annulus is requested) the background
+    subtraction itself, since clipping a 1440x1080 frame is not free.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Two-dimensional image.
+
+    Returns
+    -------
+    tuple
+        (median, std, n_pixels) of the sigma-clipped frame, where `n_pixels` is
+        the number of pixels surviving the clip.
+    """
+    clipped = SigmaClip(sigma=SIGMA_CLIP)(data.ravel(), masked=True)
+    return float(np.ma.median(clipped)), float(np.ma.std(clipped)), int(clipped.count())
+
+
+def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
+                  stats=None):
     """Find the brightest source in the frame and return a refined centroid.
 
     Detection uses DAOStarFinder on the median-subtracted frame, falling back to
@@ -127,6 +263,8 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA):
         Approximate source FWHM in pixels, used to size the detection kernel.
     nsigma : float, optional
         Detection threshold in units of the background standard deviation.
+    stats : tuple, optional
+        Precomputed `frame_stats` output, to avoid clipping the frame twice.
 
     Returns
     -------
@@ -138,7 +276,7 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA):
     RuntimeError
         If no source is found by either method.
     """
-    _, median, std = sigma_clipped_stats(data, sigma=SIGMA_CLIP)
+    median, std, _ = stats if stats is not None else frame_stats(data)
     subtracted = data - median
 
     finder = DAOStarFinder(threshold=nsigma * std, fwhm=fwhm_guess)
@@ -212,7 +350,7 @@ def measure_fwhm(data, position, background, fwhm_guess=DEFAULT_FWHM_GUESS):
     return fwhm
 
 
-def estimate_background_global(data):
+def estimate_background_global(data, stats=None):
     """Estimate the background from sigma-clipped statistics of the whole frame.
 
     Appropriate when the source occupies a negligible fraction of the frame, as
@@ -222,6 +360,8 @@ def estimate_background_global(data):
     ----------
     data : numpy.ndarray
         Two-dimensional image.
+    stats : tuple, optional
+        Precomputed `frame_stats` output, returned unchanged when given.
 
     Returns
     -------
@@ -229,12 +369,7 @@ def estimate_background_global(data):
         (median, std, n_pixels) of the sigma-clipped background, where
         `n_pixels` is the number of pixels surviving the clip.
     """
-    clipper = SigmaClip(sigma=SIGMA_CLIP)
-    clipped = clipper(data.ravel(), masked=True)
-    median = float(np.ma.median(clipped))
-    std = float(np.ma.std(clipped))
-    n_pix = int(clipped.count())
-    return median, std, n_pix
+    return stats if stats is not None else frame_stats(data)
 
 
 def estimate_background_annulus(data, position, r_in, r_out):
@@ -427,21 +562,23 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=No
     return out_path
 
 
-def update_csv(csv_path, row):
-    """Write one measurement to the results CSV, superseding any earlier one.
+def update_csv(csv_path, rows):
+    """Write measurements to the results CSV, superseding any earlier ones.
 
-    Rows referring to the same image are dropped and the new measurement is
-    appended at the bottom, so the table holds exactly one current result per
-    file in the order it was last measured. Filenames are compared as resolved
-    paths, so different spellings of the same file still match. The table is
-    rewritten via a temporary file and an atomic replace, so an interrupted run
-    cannot leave it truncated.
+    Existing rows referring to the same images are dropped and the new
+    measurements appended at the bottom, so the table holds exactly one current
+    result per file in the order it was last measured. Filenames are compared as
+    resolved paths, so different spellings of the same file still match. The
+    table is rewritten via a temporary file and an atomic replace, so an
+    interrupted run cannot leave it truncated. Called once per invocation rather
+    than once per frame, both to avoid rewriting the table N times and so that a
+    failed batch does not leave it half updated.
 
     Parameters
     ----------
     csv_path : pathlib.Path
         Destination CSV. Created along with its parent directory if absent.
-    row : dict
+    rows : list of dict
         Measurement values keyed by the names in `CSV_COLUMNS`.
 
     Returns
@@ -458,14 +595,14 @@ def update_csv(csv_path, row):
         except OSError:
             return str(name)
 
-    new_key = key(row["filename"])
+    new_keys = {key(row["filename"]) for row in rows}
     kept = []
     n_replaced = 0
 
     if csv_path.exists():
         with csv_path.open(newline="") as handle:
             for existing in csv.DictReader(handle):
-                if key(existing.get("filename", "")) == new_key:
+                if key(existing.get("filename", "")) in new_keys:
                     n_replaced += 1
                 else:
                     kept.append(existing)
@@ -476,7 +613,7 @@ def update_csv(csv_path, row):
                                 extrasaction="ignore")
         writer.writeheader()
         writer.writerows(kept)
-        writer.writerow(row)
+        writer.writerows(rows)
     tmp_path.replace(csv_path)
 
     return csv_path, n_replaced
@@ -496,10 +633,12 @@ def parse_args(argv=None):
         Parsed arguments.
     """
     parser = argparse.ArgumentParser(
-        description="Aperture photometry of a single fiber output in a TIFF frame.",
+        description="Aperture photometry of a single fiber output in TIFF frames.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("image", type=Path, help="input TIFF frame")
+    parser.add_argument("inputs", nargs="+", metavar="INPUT",
+                        help="TIFF frames, directories whose top-level TIFFs are "
+                             "measured, or a text file listing either one per line")
     parser.add_argument("--fwhm-guess", type=float, default=DEFAULT_FWHM_GUESS,
                         help="approximate source FWHM in pixels, used for detection")
     parser.add_argument("--k-fwhm", type=float, default=DEFAULT_K_FWHM,
@@ -524,47 +663,49 @@ def parse_args(argv=None):
     parser.add_argument("--outdir", type=Path, default=Path("results"),
                         help="directory for the figure and CSV")
     parser.add_argument("--no-plot", action="store_true",
-                        help="do not open the interactive figure window "
-                             "(the PNG is still written to --outdir)")
+                        help="do not open the interactive figure window (the PNG is "
+                             "still written to --outdir; windows are suppressed "
+                             "automatically when measuring more than one frame)")
+    parser.add_argument("--no-figure", action="store_true",
+                        help="skip the diagnostic figure entirely, saving ~0.3 s "
+                             "per frame")
     parser.add_argument("--no-csv", action="store_true",
-                        help="do not append a row to the results CSV")
+                        help="do not write results to the CSV table")
 
     return parser.parse_args(argv)
 
 
-def main(argv=None):
-    """Run the end-to-end measurement for one image.
+def measure_frame(image_path, args, show=False):
+    """Measure one frame and report the result to stdout.
 
     Parameters
     ----------
-    argv : list of str, optional
-        Argument list to parse. Defaults to `sys.argv[1:]`.
+    image_path : pathlib.Path
+        The TIFF frame to measure.
+    args : argparse.Namespace
+        Parsed command-line options.
+    show : bool, optional
+        If True, open an interactive figure window for this frame.
 
     Returns
     -------
-    int
-        Process exit status: 0 on success, 1 on a handled failure.
+    dict
+        A CSV row of the measurement, keyed by the names in `CSV_COLUMNS`.
+
+    Raises
+    ------
+    Exception
+        Propagates whatever the underlying readers and photometry raise, for
+        example `tifffile.TiffFileError` for an unreadable frame, `ValueError`
+        for one that is not 2D, or `RuntimeError` if no source is detected. The
+        caller decides whether that ends the run.
     """
-    args = parse_args(argv)
+    data = load_image(image_path, plane=args.plane)
+    stats = frame_stats(data)
 
-    if args.no_plot:
-        import matplotlib
-        matplotlib.use("Agg")
-
-    try:
-        data = load_image(args.image, plane=args.plane)
-    except (OSError, ValueError) as exc:
-        print(f"ERROR: could not read {args.image}: {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        position = locate_source(data, fwhm_guess=args.fwhm_guess, nsigma=args.nsigma)
-    except RuntimeError as exc:
-        print(f"ERROR: {args.image}: {exc}", file=sys.stderr)
-        return 1
-
-    _, rough_bkg, _ = sigma_clipped_stats(data, sigma=SIGMA_CLIP)
-    fwhm = measure_fwhm(data, position, rough_bkg, fwhm_guess=args.fwhm_guess)
+    position = locate_source(data, fwhm_guess=args.fwhm_guess, nsigma=args.nsigma,
+                             stats=stats)
+    fwhm = measure_fwhm(data, position, stats[0], fwhm_guess=args.fwhm_guess)
     radius = args.radius if args.radius is not None else args.k_fwhm * fwhm
 
     annulus = None
@@ -576,7 +717,7 @@ def main(argv=None):
         annulus = CircularAnnulus(position, r_in=r_in, r_out=r_out)
         bkg_method = f"annulus[{r_in:.1f}-{r_out:.1f}]"
     else:
-        bkg_median, bkg_std, n_bkg_pix = estimate_background_global(data)
+        bkg_median, bkg_std, n_bkg_pix = estimate_background_global(data, stats=stats)
         bkg_method = "global"
 
     result = measure_counts(
@@ -584,7 +725,7 @@ def main(argv=None):
         gain=args.gain, read_noise_e=args.read_noise,
     )
 
-    print(f"\nfile        : {args.image}")
+    print(f"\nfile        : {image_path}")
     print(f"centroid    : ({position[0]:.2f}, {position[1]:.2f}) px")
     print(f"FWHM        : {fwhm:.2f} px")
     print(f"aperture    : r = {radius:.2f} px  (area {result['area']:.1f} px^2)")
@@ -597,33 +738,86 @@ def main(argv=None):
         print(f"WARNING: {result['n_saturated']} saturated pixels (>= {SATURATION_ADU} "
               "counts) inside the aperture - the measured counts are a lower limit.")
 
-    figure_path = args.outdir / f"{args.image.stem}_aperture.png"
-    make_figure(data, position, result["aperture"], fwhm, bkg_median, figure_path,
-                annulus=annulus, show=not args.no_plot)
-    print(f"figure      : {figure_path}")
+    if not args.no_figure:
+        figure_path = args.outdir / f"{image_path.stem}_aperture.png"
+        make_figure(data, position, result["aperture"], fwhm, bkg_median, figure_path,
+                    annulus=annulus, show=show)
+        print(f"figure      : {figure_path}")
 
-    if not args.no_csv:
-        csv_path, n_replaced = update_csv(args.outdir / CSV_NAME, {
-            "filename": str(args.image),
-            "x": f"{position[0]:.3f}",
-            "y": f"{position[1]:.3f}",
-            "fwhm_pix": f"{fwhm:.3f}",
-            "radius_pix": f"{radius:.3f}",
-            "bkg_method": bkg_method,
-            "bkg_median": f"{bkg_median:.4f}",
-            "bkg_std": f"{bkg_std:.4f}",
-            "net_counts": f"{result['net_counts']:.6e}",
-            "counts_err": f"{result['counts_err']:.6e}",
-            "snr": f"{result['snr']:.2f}",
-            "n_saturated": result["n_saturated"],
-            "gain": args.gain,
-            "read_noise_e": args.read_noise,
-        })
+    return {
+        "filename": str(image_path),
+        "x": f"{position[0]:.3f}",
+        "y": f"{position[1]:.3f}",
+        "fwhm_pix": f"{fwhm:.3f}",
+        "radius_pix": f"{radius:.3f}",
+        "bkg_method": bkg_method,
+        "bkg_median": f"{bkg_median:.4f}",
+        "bkg_std": f"{bkg_std:.4f}",
+        "net_counts": f"{result['net_counts']:.6e}",
+        "counts_err": f"{result['counts_err']:.6e}",
+        "snr": f"{result['snr']:.2f}",
+        "n_saturated": result["n_saturated"],
+        "gain": args.gain,
+        "read_noise_e": args.read_noise,
+    }
+
+
+def main(argv=None):
+    """Measure every requested frame and write the results.
+
+    A frame that cannot be read or has no detectable source is reported and
+    skipped, so one bad file does not abandon a batch. The CSV is written once,
+    after all frames are measured.
+
+    Parameters
+    ----------
+    argv : list of str, optional
+        Argument list to parse. Defaults to `sys.argv[1:]`.
+
+    Returns
+    -------
+    int
+        Process exit status: 0 if every frame succeeded, 1 otherwise.
+    """
+    args = parse_args(argv)
+
+    try:
+        frames = gather_frames(args.inputs)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    # An interactive window per frame is unusable in a batch, and a headless
+    # backend is needed as soon as nothing is displayed at all.
+    show = not args.no_plot and not args.no_figure and len(frames) == 1
+    if not show:
+        import matplotlib
+        matplotlib.use("Agg")
+
+    if len(frames) > 1:
+        print(f"measuring {len(frames)} frames")
+
+    rows = []
+    failures = []
+
+    for frame in frames:
+        try:
+            rows.append(measure_frame(frame, args, show=show))
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not end the batch
+            failures.append(frame)
+            print(f"ERROR: {frame}: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+
+    if rows and not args.no_csv:
+        csv_path, n_replaced = update_csv(args.outdir / CSV_NAME, rows)
         superseded = f" (replaced {n_replaced} earlier row"
         superseded += "s)" if n_replaced > 1 else ")"
-        print(f"csv         : {csv_path}{superseded if n_replaced else ''}")
+        print(f"\ncsv         : {csv_path}{superseded if n_replaced else ''}")
 
-    return 0
+    if len(frames) > 1 or failures:
+        print(f"measured {len(rows)}/{len(frames)} frames"
+              + (f", {len(failures)} failed" if failures else ""))
+
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
