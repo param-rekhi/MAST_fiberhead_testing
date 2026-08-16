@@ -17,6 +17,8 @@ This will grow into a small toolkit to conduct photometry on images of the fiber
 
 ## Rules
 - Ask before overwriting or deleting any files in `data/`
+- Save every accepted plan to `.claude-plans/plan_<relevant_title>.md`, with a
+  timestamp at the top of the document
 - Prioritize proper documentation over inline comments — e.g. clear docstrings 
   (purpose, parameters, returns) for every function/script, rather than 
   line-by-line comments
