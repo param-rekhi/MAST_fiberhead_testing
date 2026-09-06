@@ -8,6 +8,12 @@ This will grow into a small toolkit to conduct photometry on images of the fiber
 - There will be separate scripts for aperture and psf photometry, as well as for single and multiple sources (i.e. fiber outputs) per image.
 - Eventually these may share common helper code (e.g. reading FITS files, source detection, output formatting)
 
+## Using the code
+- The scripts are also importable as libraries. `aperture_photometry_single.py`
+  exposes `measure_single_image` (one in-memory frame -> dict of numbers) and
+  `measure_images` (a list of arrays or paths -> pandas DataFrame) for notebook
+  use; see the "Use from a notebook" section of its module docstring.
+
 ## Data and results
 - Raw data lives in subdirectories in `data/`
 - Any saved outputs go in `results/` when applicable

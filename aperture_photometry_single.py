@@ -26,6 +26,23 @@ Examples
     python aperture_photometry_single.py data/run01/frame_001.tif
     python aperture_photometry_single.py data/run01/
     python aperture_photometry_single.py frames_to_measure.txt
+
+Use from a notebook
+-------------------
+The module is importable as a library, and the measurement is array-native, so
+frames already in memory can be measured without going through disk or the CLI.
+There is no package, so the repo root has to be on `sys.path`:
+
+    import sys; sys.path.insert(0, "/path/to/MAST_fiberhead_testing")
+    from aperture_photometry_single import measure_images, measure_single_image
+
+    df = measure_images(my_arrays)              # list of 2D arrays
+    df = measure_images(paths, k_fwhm=3.0)      # or a list of paths
+    res = measure_single_image(arr, plot=True)  # one frame, with a figure
+
+`measure_images` returns a pandas DataFrame of numbers, not the CSV's formatted
+strings, and writes nothing to disk. Every CLI option is available to both as a
+keyword argument.
 """
 
 from __future__ import annotations
@@ -102,6 +119,30 @@ CSV_COLUMNS = [
     "counts_err",
     "snr",
     "n_saturated",
+    "gain",
+    "read_noise_e",
+]
+
+# Columns of the DataFrame returned by measure_images. A superset of
+# CSV_COLUMNS: the notebook table carries the background pixel count, the
+# aperture area and the per-pixel sigma as well, which the CSV has no room for.
+RESULT_COLUMNS = [
+    "name",
+    "x",
+    "y",
+    "fwhm_pix",
+    "radius_pix",
+    "detect_method",
+    "bkg_method",
+    "bkg_median",
+    "bkg_std",
+    "n_bkg_pix",
+    "net_counts",
+    "counts_err",
+    "snr",
+    "n_saturated",
+    "area",
+    "sigma_pix",
     "gain",
     "read_noise_e",
 ]
@@ -718,9 +759,9 @@ def display_limits(values):
     return float(vmin), float(vmax)
 
 
-def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=None,
-                show=True):
-    """Save (and optionally display) the cutout and curve-of-growth diagnostic.
+def make_figure(data, position, aperture, fwhm, bkg_median, out_path=None, annulus=None,
+                show=True, close=True):
+    """Build the cutout and curve-of-growth diagnostic figure.
 
     The cutout axes are shifted so that the source centroid sits at (0, 0), i.e.
     the tick labels give the offset from the source in pixels. pyplot is imported
@@ -739,17 +780,22 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=No
         Measured source FWHM in pixels; drawn as a circle of radius FWHM / 2.
     bkg_median : float
         Background level per pixel, subtracted before building the growth curve.
-    out_path : pathlib.Path
-        Destination for the PNG.
+    out_path : pathlib.Path, optional
+        Destination for the PNG. If None the figure is not written to disk, which
+        is what a notebook caller wants.
     annulus : photutils.aperture.CircularAnnulus, optional
         Background annulus to overlay, when local background estimation was used.
     show : bool, optional
         If True, open an interactive figure window.
+    close : bool, optional
+        If True, close the figure before returning. Pass False to keep it alive
+        for a notebook, whose inline backend renders the figures still open when
+        the cell finishes.
 
     Returns
     -------
-    pathlib.Path
-        The path the figure was written to.
+    matplotlib.figure.Figure
+        The figure, already closed unless `close` is False.
     """
     import matplotlib.pyplot as plt
 
@@ -801,14 +847,17 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=No
     ax_cog.legend(loc="lower right", fontsize=8)
 
     fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
+
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=150)
 
     if show:
         plt.show()
-    plt.close(fig)
+    if close:
+        plt.close(fig)
 
-    return out_path
+    return fig
 
 
 def update_csv(csv_path, rows):
@@ -979,11 +1028,303 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def measure_frame(image_path, args, show=False):
-    """Measure one frame and report the result to stdout.
+def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
+                         k_fwhm=DEFAULT_K_FWHM, radius=None, nsigma=DEFAULT_NSIGMA,
+                         detect_method=DEFAULT_DETECT_METHOD, npixels=DEFAULT_NPIXELS,
+                         deblend=True, annulus_bkg=False, r_in=ANNULUS_IN_FWHM,
+                         r_out=ANNULUS_OUT_FWHM, gain=GAIN_E_PER_ADU,
+                         read_noise_e=READ_NOISE_E, plot=False, verbose=False):
+    """Measure one already-loaded frame and return the result as numbers.
 
-    Unless --no-plot was given, the diagnostic figure is written to
-    `PLOT_DIR/<stem>_aperture.png`.
+    This is the whole measurement in one call, and the only definition of it:
+    the command line reaches it through `measure_frame`, a notebook through
+    `measure_images` or directly. It takes an array rather than a path so that
+    frames already in memory - synthetic frames, a page pulled out of a stack,
+    anything preprocessed - can be measured without a round trip through disk.
+
+    Unlike the CSV row built by `csv_row`, every value returned here is a number
+    at full precision, ready to be computed with.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Two-dimensional image, not background subtracted.
+    name : str, optional
+        Label for this frame, passed through to the `name` field of the result.
+    fwhm_guess : float, optional
+        Expected source FWHM in pixels, used to size the detection kernel and as
+        the fallback if the profile fit does not converge.
+    k_fwhm : float, optional
+        Aperture radius in units of the measured FWHM. Ignored if `radius` is given.
+    radius : float, optional
+        Explicit aperture radius in pixels, overriding the FWHM scaling.
+    nsigma : float, optional
+        Detection threshold in units of the background scatter.
+    detect_method : {'segment', 'dao'}, optional
+        Detection method, as for --detect-method.
+    npixels : int, optional
+        Smallest connected area a segmentation detection may have.
+    deblend : bool, optional
+        Whether to deblend segments before picking the brightest.
+    annulus_bkg : bool, optional
+        If True, estimate the background from a local annulus rather than from
+        the whole frame.
+    r_in, r_out : float, optional
+        Annulus radii in units of the measured FWHM. Used only when `annulus_bkg`.
+    gain : float, optional
+        Detector gain in e-/ADU.
+    read_noise_e : float, optional
+        RMS read noise in e-.
+    plot : bool, optional
+        If True, build the diagnostic figure and return it under the `figure`
+        key. Nothing is written to disk and the figure is left open, so a
+        notebook's inline backend renders it when the cell finishes.
+    verbose : bool, optional
+        If True, print the same summary the command line prints.
+
+    Returns
+    -------
+    dict
+        The measurement. The `RESULT_COLUMNS` keys - `name`, `x`, `y`,
+        `fwhm_pix`, `radius_pix`, `detect_method`, `bkg_method`, `bkg_median`,
+        `bkg_std`, `n_bkg_pix`, `net_counts`, `counts_err`, `snr`,
+        `n_saturated`, `area`, `sigma_pix`, `gain`, `read_noise_e` - are all
+        numbers or strings. Alongside them are the photutils objects the
+        measurement used, `aperture` and `annulus` (None unless `annulus_bkg`),
+        and `figure` when `plot` is True.
+
+    Raises
+    ------
+    ValueError
+        If `data` is not two-dimensional.
+    RuntimeError
+        If no source is detected.
+
+    See Also
+    --------
+    measure_images : the same measurement over a list of frames, as a DataFrame.
+    """
+    data = np.asarray(data, dtype=np.float64)
+    if data.ndim != 2:
+        msg = f"expected a 2D image, got an array of shape {data.shape}"
+        raise ValueError(msg)
+
+    stats = frame_stats(data)
+
+    position = locate_source(data, fwhm_guess=fwhm_guess, nsigma=nsigma, stats=stats,
+                             method=detect_method, npixels=npixels, deblend=deblend)
+    fwhm = measure_fwhm(data, position, stats[0], fwhm_guess=fwhm_guess)
+    aperture_radius = radius if radius is not None else k_fwhm * fwhm
+
+    annulus = None
+    if annulus_bkg:
+        ann_in, ann_out = r_in * fwhm, r_out * fwhm
+        bkg_median, bkg_std, n_bkg_pix = estimate_background_annulus(
+            data, position, ann_in, ann_out
+        )
+        annulus = CircularAnnulus(position, r_in=ann_in, r_out=ann_out)
+        bkg_method = f"annulus[{ann_in:.1f}-{ann_out:.1f}]"
+    else:
+        bkg_median, bkg_std, n_bkg_pix = estimate_background_global(data, stats=stats)
+        bkg_method = "global"
+
+    counts = measure_counts(
+        data, position, aperture_radius, bkg_median, bkg_std, n_bkg_pix,
+        gain=gain, read_noise_e=read_noise_e,
+    )
+
+    result = {
+        "name": name,
+        "x": float(position[0]),
+        "y": float(position[1]),
+        "fwhm_pix": float(fwhm),
+        "radius_pix": float(aperture_radius),
+        "detect_method": detect_method,
+        "bkg_method": bkg_method,
+        "bkg_median": float(bkg_median),
+        "bkg_std": float(bkg_std),
+        "n_bkg_pix": int(n_bkg_pix),
+        "net_counts": counts["net_counts"],
+        "counts_err": counts["counts_err"],
+        "snr": counts["snr"],
+        "n_saturated": counts["n_saturated"],
+        "area": counts["area"],
+        "sigma_pix": counts["sigma_pix"],
+        "gain": gain,
+        "read_noise_e": read_noise_e,
+        "aperture": counts["aperture"],
+        "annulus": annulus,
+    }
+
+    if verbose:
+        report_measurement(result)
+
+    if plot:
+        result["figure"] = make_figure(
+            data, position, counts["aperture"], fwhm, bkg_median,
+            annulus=annulus, show=False, close=False,
+        )
+
+    return result
+
+
+def report_measurement(result):
+    """Print the headline numbers of a measurement to stdout.
+
+    Kept out of `measure_single_image` so that the command line and a verbose notebook
+    call print the same thing from one definition.
+
+    Parameters
+    ----------
+    result : dict
+        A result from `measure_single_image`. The leading `file` line is omitted when
+        its `name` is None.
+
+    Returns
+    -------
+    None
+    """
+    if result["name"] is not None:
+        print(f"\nfile        : {result['name']}")
+    print(f"centroid    : ({result['x']:.2f}, {result['y']:.2f}) px "
+          f"[{result['detect_method']}]")
+    print(f"FWHM        : {result['fwhm_pix']:.2f} px")
+    print(f"aperture    : r = {result['radius_pix']:.2f} px  "
+          f"(area {result['area']:.1f} px^2)")
+    print(f"background  : {result['bkg_median']:.3f} +/- {result['bkg_std']:.3f} "
+          f"counts/px [{result['bkg_method']}, {result['n_bkg_pix']} px]")
+    print(f"counts      : {result['net_counts']:.4e} +/- {result['counts_err']:.2e} "
+          f"(SNR {result['snr']:.1f})")
+
+    if result["n_saturated"] > 0:
+        print(f"WARNING: {result['n_saturated']} saturated pixels "
+              f"(>= {SATURATION_ADU} counts) inside the aperture - the measured "
+              "counts are a lower limit.")
+
+
+def measure_images(images, plane=0, plot=False, verbose=False, on_error="raise",
+                   **params):
+    """Measure a list of frames and return the results as a DataFrame.
+
+    The notebook counterpart of the command line: the same measurement, no files
+    written, and the results as numeric columns rather than a CSV of formatted
+    strings.
+
+    Parameters
+    ----------
+    images : sequence
+        The frames to measure, as a list of 2D arrays or a list of paths (`str`
+        or `pathlib.Path`); the two may be mixed, since each element is
+        dispatched on its own type. A single array or a single path is accepted
+        as a one-element list. Paths are read with `load_image`.
+    plane : int, optional
+        Page to select from multi-page TIFFs. Applies to path inputs only.
+    plot : bool, optional
+        If True, build a diagnostic figure per frame. The figures are left open
+        rather than saved, so a notebook's inline backend renders them when the
+        cell finishes; they are not part of the returned table.
+    verbose : bool, optional
+        If True, print the summary for each frame.
+    on_error : {'raise', 'skip'}, optional
+        What to do when a frame fails. 'raise', the default, propagates the
+        exception, on the grounds that a row silently missing from a notebook
+        table is worse than a traceback. 'skip' reports the failure on stderr
+        and omits the row, which is usually what a long batch wants.
+    **params
+        Forwarded to `measure_single_image`, so every measurement option is available
+        by keyword: `fwhm_guess`, `k_fwhm`, `radius`, `nsigma`, `detect_method`,
+        `npixels`, `deblend`, `annulus_bkg`, `r_in`, `r_out`, `gain`,
+        `read_noise_e`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per successfully measured frame, with the columns named in
+        `RESULT_COLUMNS`. The `name` column holds the path for path inputs and
+        `image_<index>` for array inputs. Empty input, or a batch in which every
+        frame failed under `on_error='skip'`, gives an empty DataFrame with
+        those columns.
+
+    Raises
+    ------
+    ValueError
+        If `on_error` is not 'raise' or 'skip'.
+
+    Examples
+    --------
+    >>> df = measure_images(my_arrays)                             # doctest: +SKIP
+    >>> df = measure_images(paths, k_fwhm=3.0, annulus_bkg=True)   # doctest: +SKIP
+    """
+    # pandas is as expensive to import as astropy and the command line never
+    # needs it, so it is imported here rather than at module scope.
+    import pandas as pd
+
+    if on_error not in ("raise", "skip"):
+        msg = f"on_error must be 'raise' or 'skip', not {on_error!r}"
+        raise ValueError(msg)
+
+    if isinstance(images, (str, Path)) or (
+        isinstance(images, np.ndarray) and images.ndim == 2
+    ):
+        images = [images]
+
+    rows = []
+    for index, image in enumerate(images):
+        is_path = isinstance(image, (str, Path))
+        name = str(image) if is_path else f"image_{index}"
+
+        try:
+            data = load_image(image, plane=plane) if is_path else image
+            rows.append(measure_single_image(data, name=name, plot=plot,
+                                             verbose=verbose, **params))
+        except Exception as exc:  # noqa: BLE001 - the policy is the caller's
+            if on_error == "raise":
+                raise
+            print(f"ERROR: {name}: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+
+    # Selecting the columns explicitly drops the photutils objects and the
+    # figure, which have no place in a table.
+    return pd.DataFrame(rows, columns=RESULT_COLUMNS)
+
+
+def csv_row(result):
+    """Format a measurement as a row of the results CSV.
+
+    Parameters
+    ----------
+    result : dict
+        A result from `measure_single_image`. Its `name` becomes the `filename` column.
+
+    Returns
+    -------
+    dict
+        A row keyed by the names in `CSV_COLUMNS`.
+    """
+    return {
+        "filename": result["name"],
+        "x": f"{result['x']:.3f}",
+        "y": f"{result['y']:.3f}",
+        "fwhm_pix": f"{result['fwhm_pix']:.3f}",
+        "radius_pix": f"{result['radius_pix']:.3f}",
+        "detect_method": result["detect_method"],
+        "bkg_method": result["bkg_method"],
+        "bkg_median": f"{result['bkg_median']:.4f}",
+        "bkg_std": f"{result['bkg_std']:.4f}",
+        "net_counts": f"{result['net_counts']:.6e}",
+        "counts_err": f"{result['counts_err']:.6e}",
+        "snr": f"{result['snr']:.2f}",
+        "n_saturated": result["n_saturated"],
+        "gain": result["gain"],
+        "read_noise_e": result["read_noise_e"],
+    }
+
+
+def measure_frame(image_path, args, show=False):
+    """Measure one frame from disk and report the result to stdout.
+
+    The command-line adapter around `measure_single_image`: it reads the file, unpacks
+    the parsed options into keyword arguments, and writes the diagnostic figure
+    to `PLOT_DIR/<stem>_aperture.png` unless --no-plot was given.
 
     Parameters
     ----------
@@ -1009,71 +1350,27 @@ def measure_frame(image_path, args, show=False):
 
     See Also
     --------
+    measure_single_image : the measurement itself, for callers that are not the CLI.
     locate_source : detection, selected by --detect-method.
     """
     data = load_image(image_path, plane=args.plane)
-    stats = frame_stats(data)
 
-    position = locate_source(data, fwhm_guess=args.fwhm_guess, nsigma=args.nsigma,
-                             stats=stats, method=args.detect_method,
-                             npixels=args.npixels, deblend=not args.no_deblend)
-    fwhm = measure_fwhm(data, position, stats[0], fwhm_guess=args.fwhm_guess)
-    radius = args.radius if args.radius is not None else args.k_fwhm * fwhm
-
-    annulus = None
-    if args.annulus_bkg:
-        r_in, r_out = args.r_in * fwhm, args.r_out * fwhm
-        bkg_median, bkg_std, n_bkg_pix = estimate_background_annulus(
-            data, position, r_in, r_out
-        )
-        annulus = CircularAnnulus(position, r_in=r_in, r_out=r_out)
-        bkg_method = f"annulus[{r_in:.1f}-{r_out:.1f}]"
-    else:
-        bkg_median, bkg_std, n_bkg_pix = estimate_background_global(data, stats=stats)
-        bkg_method = "global"
-
-    result = measure_counts(
-        data, position, radius, bkg_median, bkg_std, n_bkg_pix,
-        gain=args.gain, read_noise_e=args.read_noise,
+    result = measure_single_image(
+        data, name=str(image_path), fwhm_guess=args.fwhm_guess, k_fwhm=args.k_fwhm,
+        radius=args.radius, nsigma=args.nsigma, detect_method=args.detect_method,
+        npixels=args.npixels, deblend=not args.no_deblend,
+        annulus_bkg=args.annulus_bkg, r_in=args.r_in, r_out=args.r_out,
+        gain=args.gain, read_noise_e=args.read_noise, verbose=True,
     )
-
-    print(f"\nfile        : {image_path}")
-    print(f"centroid    : ({position[0]:.2f}, {position[1]:.2f}) px "
-          f"[{args.detect_method}]")
-    print(f"FWHM        : {fwhm:.2f} px")
-    print(f"aperture    : r = {radius:.2f} px  (area {result['area']:.1f} px^2)")
-    print(f"background  : {bkg_median:.3f} +/- {bkg_std:.3f} counts/px "
-          f"[{bkg_method}, {n_bkg_pix} px]")
-    print(f"counts      : {result['net_counts']:.4e} +/- {result['counts_err']:.2e} "
-          f"(SNR {result['snr']:.1f})")
-
-    if result["n_saturated"] > 0:
-        print(f"WARNING: {result['n_saturated']} saturated pixels (>= {SATURATION_ADU} "
-              "counts) inside the aperture - the measured counts are a lower limit.")
 
     if not args.no_plot:
         figure_path = PLOT_DIR / f"{image_path.stem}_aperture.png"
-        make_figure(data, position, result["aperture"], fwhm, bkg_median, figure_path,
-                    annulus=annulus, show=show)
+        make_figure(data, (result["x"], result["y"]), result["aperture"],
+                    result["fwhm_pix"], result["bkg_median"], figure_path,
+                    annulus=result["annulus"], show=show)
         print(f"figure      : {figure_path}")
 
-    return {
-        "filename": str(image_path),
-        "x": f"{position[0]:.3f}",
-        "y": f"{position[1]:.3f}",
-        "fwhm_pix": f"{fwhm:.3f}",
-        "radius_pix": f"{radius:.3f}",
-        "detect_method": args.detect_method,
-        "bkg_method": bkg_method,
-        "bkg_median": f"{bkg_median:.4f}",
-        "bkg_std": f"{bkg_std:.4f}",
-        "net_counts": f"{result['net_counts']:.6e}",
-        "counts_err": f"{result['counts_err']:.6e}",
-        "snr": f"{result['snr']:.2f}",
-        "n_saturated": result["n_saturated"],
-        "gain": args.gain,
-        "read_noise_e": args.read_noise,
-    }
+    return csv_row(result)
 
 
 def main(argv=None):
