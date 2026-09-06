@@ -5,6 +5,11 @@ Locates the one bright spot in a TIFF frame, measures its FWHM, subtracts a
 background estimated either globally or from a local annulus, and integrates the
 counts inside a circular aperture whose radius is scaled to the measured FWHM.
 
+The spot is found by segmentation: the brightest group of connected pixels above
+the detection threshold that covers at least --npixels pixels. Requiring an area
+is what keeps hot pixels and small noise clumps from being taken for the fiber on
+a faint frame. --detect-method dao selects PSF-correlation detection instead.
+
 Outputs a row in a CSV table of measurements (see --outfile), a summary printed
 to stdout, and a two-panel diagnostic figure (annotated cutout + curve of growth)
 written to `plots/`. The figures are throwaway sanity checks, so their location
@@ -41,9 +46,15 @@ from photutils.aperture import (
     CircularAperture,
     aperture_photometry,
 )
-from photutils.centroids import centroid_quadratic
+from photutils.centroids import centroid_quadratic, centroid_sources
 from photutils.detection import DAOStarFinder, find_peaks
 from photutils.profiles import CurveOfGrowth, RadialProfile
+from photutils.segmentation import (
+    SourceCatalog,
+    deblend_sources,
+    detect_sources,
+    make_2dgaussian_kernel,
+)
 from photutils.utils import calc_total_error
 
 # Detector properties of the fiberhead test camera.
@@ -58,6 +69,17 @@ ANNULUS_IN_FWHM = 4.0
 ANNULUS_OUT_FWHM = 7.0
 DEFAULT_NSIGMA = 5.0
 SIGMA_CLIP = 3.0
+DEFAULT_NPIXELS = 25  # smallest connected area a segmentation detection may have
+
+# Smallest per-pixel scatter a digitized signal can meaningfully have: the
+# standard deviation of the rounding error of a quantizer with a 1-count step.
+# Faint frames on this 10-bit sensor sit at 1-2 counts, where sigma clipping can
+# discard the whole noise tail and return a scatter of exactly zero; flooring it
+# here keeps the detection threshold from collapsing to the background level.
+DIGITIZATION_SIGMA = 1.0 / np.sqrt(12.0)
+
+DETECT_METHODS = ("segment", "dao")
+DEFAULT_DETECT_METHOD = "segment"
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
@@ -72,6 +94,7 @@ CSV_COLUMNS = [
     "y",
     "fwhm_pix",
     "radius_pix",
+    "detect_method",
     "bkg_method",
     "bkg_median",
     "bkg_std",
@@ -237,6 +260,15 @@ def frame_stats(data):
     background and (unless a local annulus is requested) the background
     subtraction itself, since clipping a 1440x1080 frame is not free.
 
+    The scatter is floored at `DIGITIZATION_SIGMA`. On a faint frame sitting at
+    one or two counts, the pixel distribution is a spike at the background with a
+    sparse tail one count above it, and sigma clipping discards that tail - the
+    only noise there is - leaving a scatter of exactly zero. Anything scaled by
+    the scatter then degenerates: a 5-sigma detection threshold becomes a 0-sigma
+    one that flags every pixel above the background. The floor is the standard
+    deviation of a 1-count quantizer's rounding error, so it says no more than
+    that a digitized frame cannot be quieter than its own digitization.
+
     Parameters
     ----------
     data : numpy.ndarray
@@ -245,20 +277,175 @@ def frame_stats(data):
     Returns
     -------
     tuple
-        (median, std, n_pixels) of the sigma-clipped frame, where `n_pixels` is
-        the number of pixels surviving the clip.
+        (median, std, n_pixels) of the sigma-clipped frame, where `std` is not
+        less than `DIGITIZATION_SIGMA` and `n_pixels` is the number of pixels
+        surviving the clip.
     """
     clipped = SigmaClip(sigma=SIGMA_CLIP)(data.ravel(), masked=True)
-    return float(np.ma.median(clipped)), float(np.ma.std(clipped)), int(clipped.count())
+    median, std = float(np.ma.median(clipped)), float(np.ma.std(clipped))
+
+    if std < DIGITIZATION_SIGMA:
+        # Only worth reporting when the clip has actually lost the noise tail. A
+        # frame whose scatter merely rounds down to just under the floor is not
+        # telling the reader anything.
+        if std < 0.9 * DIGITIZATION_SIGMA:
+            print(f"[stats] sigma-clipped scatter is {std:.3f} counts/px, below the "
+                  f"digitization floor; using {DIGITIZATION_SIGMA:.3f} instead")
+        std = DIGITIZATION_SIGMA
+
+    return median, std, int(clipped.count())
+
+
+def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
+                   nsigma=DEFAULT_NSIGMA, npixels=DEFAULT_NPIXELS, deblend=True):
+    """Find the brightest source by image segmentation.
+
+    The frame is background-subtracted and convolved with a Gaussian kernel
+    matched to the expected source size, then pixels above `nsigma` times the
+    background scatter are grouped into connected segments of at least `npixels`
+    pixels. The brightest segment by total flux is taken as the source.
+
+    Requiring a minimum connected area is what makes this robust on faint frames:
+    a fiber output is an extended blob, so single-pixel spikes and two- or
+    three-pixel noise clumps are rejected structurally rather than incidentally,
+    as they are by DAOStarFinder's PSF-correlation and sharpness cuts.
+
+    Deblending splits segments that merge several peaks. It matters whenever the
+    frame carries diffuse scattered light: without it, a bright fiber sitting
+    inside a large low-level glow is absorbed into the glow's segment, and the
+    reported position is the centroid of the glow rather than of the fiber.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Two-dimensional image.
+    median : float
+        Background level to subtract before detection.
+    std : float
+        Per-pixel background scatter that `nsigma` is measured in.
+    fwhm_guess : float, optional
+        Approximate source FWHM in pixels, used to size the convolution kernel.
+    nsigma : float, optional
+        Detection threshold in units of `std`.
+    npixels : int, optional
+        Smallest number of connected pixels a detection may have.
+    deblend : bool, optional
+        Whether to deblend merged segments. Costs seconds on a frame with
+        hundreds of segments and nothing on a clean one.
+
+    Returns
+    -------
+    tuple or None
+        ((x, y), n_segments) for the brightest segment, or None if nothing was
+        detected.
+    """
+    kernel_size = 2 * int(np.ceil(fwhm_guess)) + 1
+    convolved = convolve(data - median, make_2dgaussian_kernel(fwhm_guess, kernel_size))
+
+    segments = detect_sources(convolved, nsigma * std, n_pixels=npixels)
+    if segments is None:
+        return None
+
+    if deblend:
+        segments = deblend_sources(convolved, segments, npixels, progress_bar=False)
+
+    catalog = SourceCatalog(data - median, segments, convolved_data=convolved)
+    flux = np.asarray(catalog.segment_flux, dtype=float)
+    if not np.isfinite(flux).any():
+        return None
+
+    brightest = int(np.nanargmax(flux))
+    position = (float(catalog.x_centroid[brightest]),
+                float(catalog.y_centroid[brightest]))
+    if not np.isfinite(position).all():
+        return None
+
+    return position, segments.n_labels
+
+
+def detect_dao(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
+               nsigma=DEFAULT_NSIGMA):
+    """Find the brightest source with DAOStarFinder.
+
+    Correlates the background-subtracted frame against a Gaussian PSF of the
+    guessed FWHM and takes the highest-flux detection. Better suited to
+    star-like sources than to the extended fiber outputs this script measures,
+    and kept mainly so the two detection methods can be compared on real frames.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Two-dimensional image.
+    median : float
+        Background level to subtract before detection.
+    std : float
+        Per-pixel background scatter that `nsigma` is measured in.
+    fwhm_guess : float, optional
+        Approximate source FWHM in pixels, used to size the detection kernel.
+    nsigma : float, optional
+        Detection threshold in units of `std`.
+
+    Returns
+    -------
+    tuple or None
+        ((x, y), n_sources) for the brightest detection, or None if nothing was
+        found.
+    """
+    sources = DAOStarFinder(threshold=nsigma * std, fwhm=fwhm_guess)(data - median)
+    if sources is None or len(sources) == 0:
+        return None
+
+    brightest = sources[np.argmax(sources["flux"])]
+    position = (float(brightest["x_centroid"]), float(brightest["y_centroid"]))
+
+    return position, len(sources)
+
+
+def detect_peak(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
+                nsigma=DEFAULT_NSIGMA):
+    """Find the brightest peak of a smoothed frame.
+
+    Last-resort fallback for when the chosen detection method finds nothing: it
+    imposes no shape or area requirement, so it returns a position as long as
+    anything at all rises above the threshold.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Two-dimensional image.
+    median : float
+        Background level to subtract before the peak search.
+    std : float
+        Per-pixel background scatter that `nsigma` is measured in.
+    fwhm_guess : float, optional
+        Approximate source FWHM in pixels, used to size the smoothing kernel.
+    nsigma : float, optional
+        Detection threshold in units of `std`.
+
+    Returns
+    -------
+    tuple or None
+        The (x, y) position of the brightest peak, or None if nothing rose above
+        the threshold.
+    """
+    kernel = Gaussian2DKernel(x_stddev=fwhm_guess / 2.355)
+    smoothed = convolve(data - median, kernel)
+
+    peaks = find_peaks(smoothed, threshold=nsigma * std, n_peaks=1)
+    if peaks is None or len(peaks) == 0:
+        return None
+
+    return float(peaks["x_peak"][0]), float(peaks["y_peak"][0])
 
 
 def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
-                  stats=None):
+                  stats=None, method=DEFAULT_DETECT_METHOD,
+                  npixels=DEFAULT_NPIXELS, deblend=True):
     """Find the brightest source in the frame and return a refined centroid.
 
-    Detection uses DAOStarFinder on the median-subtracted frame, falling back to
-    the brightest peak of a smoothed copy if nothing is detected. The chosen
-    candidate is refined with a quadratic centroid fit.
+    Detection uses image segmentation or DAOStarFinder as selected by `method`,
+    falling back to the brightest peak of a smoothed copy if that finds nothing.
+    The chosen position is then refined with a quadratic centroid fit.
 
     Parameters
     ----------
@@ -270,6 +457,13 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
         Detection threshold in units of the background standard deviation.
     stats : tuple, optional
         Precomputed `frame_stats` output, to avoid clipping the frame twice.
+    method : {'segment', 'dao'}, optional
+        Detection method to use.
+    npixels : int, optional
+        Smallest connected area a segmentation detection may have. Ignored by
+        the `dao` method.
+    deblend : bool, optional
+        Whether to deblend merged segments. Ignored by the `dao` method.
 
     Returns
     -------
@@ -278,45 +472,57 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
 
     Raises
     ------
+    ValueError
+        If `method` is not one of `DETECT_METHODS`.
     RuntimeError
-        If no source is found by either method.
+        If neither the chosen method nor the peak-search fallback finds a source.
     """
+    if method not in DETECT_METHODS:
+        msg = f"unknown detection method {method!r}; expected one of {DETECT_METHODS}"
+        raise ValueError(msg)
+
     median, std, _ = stats if stats is not None else frame_stats(data)
-    subtracted = data - median
 
-    finder = DAOStarFinder(threshold=nsigma * std, fwhm=fwhm_guess)
-    sources = finder(subtracted)
-
-    if sources is not None and len(sources) > 0:
-        brightest = sources[np.argmax(sources["flux"])]
-        xpeak, ypeak = float(brightest["xcentroid"]), float(brightest["ycentroid"])
-        if len(sources) > 1:
-            print(
-                f"[detect] {len(sources)} sources found; using the brightest "
-                f"at ({xpeak:.1f}, {ypeak:.1f})"
-            )
+    if method == "segment":
+        found = detect_segment(data, median, std, fwhm_guess=fwhm_guess,
+                               nsigma=nsigma, npixels=npixels, deblend=deblend)
+        noun = "segments"
     else:
-        kernel = Gaussian2DKernel(x_stddev=fwhm_guess / 2.355)
-        smoothed = convolve(subtracted, kernel)
-        peaks = find_peaks(smoothed, threshold=nsigma * std, npeaks=1)
-        if peaks is None or len(peaks) == 0:
+        found = detect_dao(data, median, std, fwhm_guess=fwhm_guess, nsigma=nsigma)
+        noun = "sources"
+
+    if found is not None:
+        (xpeak, ypeak), n_found = found
+        if n_found > 1:
+            print(f"[detect] {n_found} {noun} found; using the brightest at "
+                  f"({xpeak:.1f}, {ypeak:.1f})")
+    else:
+        fallback = detect_peak(data, median, std, fwhm_guess=fwhm_guess, nsigma=nsigma)
+        if fallback is None:
             msg = (
-                "no source detected: DAOStarFinder and peak search both came up "
-                f"empty at a {nsigma:g}-sigma threshold. Try lowering --nsigma or "
-                "adjusting --fwhm-guess."
+                f"no source detected: the {method} method and the peak search both "
+                f"came up empty at a {nsigma:g}-sigma threshold. Try lowering "
+                "--nsigma or adjusting --fwhm-guess."
             )
             raise RuntimeError(msg)
-        xpeak, ypeak = float(peaks["x_peak"][0]), float(peaks["y_peak"][0])
-        print("[detect] DAOStarFinder found nothing; fell back to a smoothed peak search")
+        xpeak, ypeak = fallback
+        print(f"[detect] the {method} method found nothing; fell back to a smoothed "
+              "peak search")
 
+    # `fit_boxsize` has to be passed explicitly: centroid_sources cuts out a
+    # box_size region and then calls centroid_quadratic on it with that keyword
+    # left at its default of 5, which fits a 5x5 quadratic to a spot several
+    # times wider and lands about a pixel off.
     box = max(5, int(2 * round(fwhm_guess / 2)) + 1)
-    xcen, ycen = centroid_quadratic(data, xpeak=xpeak, ypeak=ypeak, fit_boxsize=box)
+    xcen, ycen = centroid_sources(data, xpeak, ypeak, box_size=box,
+                                  centroid_func=centroid_quadratic,
+                                  fit_boxsize=box)
 
     if not np.isfinite([xcen, ycen]).all():
         print("[detect] quadratic centroid failed; using the detection position")
         return xpeak, ypeak
 
-    return float(xcen), float(ycen)
+    return float(xcen[0]), float(ycen[0])
 
 
 def measure_fwhm(data, position, background, fwhm_guess=DEFAULT_FWHM_GUESS):
@@ -476,15 +682,50 @@ def measure_counts(data, position, radius, bkg_median, bkg_std, n_bkg_pix,
     }
 
 
+def display_limits(values):
+    """Return a usable (vmin, vmax) pair for displaying an image.
+
+    ZScale is the right stretch for a frame with structure, but it is derived
+    from a fit to the sorted pixel values and returns an unusable interval when
+    there is nothing to fit. A cutout that is almost entirely one value - a faint
+    frame whose background sits at a single count - can come back with vmin
+    exceeding vmax by a floating-point rounding error, which `imshow` rejects
+    outright with "minvalue must be less than or equal to maxvalue".
+
+    Falls back to the full data range, then to a unit-wide interval around the
+    single value present, so a degenerate cutout still plots.
+
+    Parameters
+    ----------
+    values : numpy.ndarray
+        Finite pixel values to derive the stretch from.
+
+    Returns
+    -------
+    tuple of float
+        (vmin, vmax) with vmax strictly greater than vmin.
+    """
+    from astropy.visualization import ZScaleInterval
+
+    vmin, vmax = ZScaleInterval().get_limits(values)
+
+    if not np.isfinite([vmin, vmax]).all() or vmax <= vmin:
+        vmin, vmax = float(np.min(values)), float(np.max(values))
+
+    if vmax <= vmin:
+        vmin, vmax = vmin - 0.5, vmax + 0.5
+
+    return float(vmin), float(vmax)
+
+
 def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=None,
                 show=True):
     """Save (and optionally display) the cutout and curve-of-growth diagnostic.
 
     The cutout axes are shifted so that the source centroid sits at (0, 0), i.e.
-    the tick labels give the offset from the source in pixels. pyplot and
-    ZScaleInterval are imported here rather than at module scope so that a
-    --no-plot run, which never calls this function, does not import matplotlib at
-    all - astropy.visualization pulls matplotlib in as a side effect.
+    the tick labels give the offset from the source in pixels. pyplot is imported
+    here rather than at module scope so that a --no-plot run, which never calls
+    this function, does not import matplotlib at all.
 
     Parameters
     ----------
@@ -511,7 +752,6 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=No
         The path the figure was written to.
     """
     import matplotlib.pyplot as plt
-    from astropy.visualization import ZScaleInterval
 
     radius = aperture.r
     hwhm = fwhm / 2.0
@@ -529,7 +769,7 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path, annulus=No
 
     fig, (ax_img, ax_cog) = plt.subplots(1, 2, figsize=(11, 4.6))
 
-    vmin, vmax = ZScaleInterval().get_limits(cutout.data[np.isfinite(cutout.data)])
+    vmin, vmax = display_limits(cutout.data[np.isfinite(cutout.data)])
     ax_img.imshow(cutout.data, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax,
                   extent=extent)
     CircularAperture((0.0, 0.0), r=radius).plot(
@@ -684,6 +924,24 @@ def parse_args(argv=None):
                         help="explicit aperture radius in pixels (overrides --k-fwhm)")
     parser.add_argument("--nsigma", type=float, default=DEFAULT_NSIGMA,
                         help="detection threshold in background sigma")
+    parser.add_argument("--detect-method", choices=DETECT_METHODS,
+                        default=DEFAULT_DETECT_METHOD,
+                        help="how to find the source. 'segment' groups connected "
+                             "pixels above the threshold into segments and takes the "
+                             "brightest, which suits an extended fiber output and "
+                             "rejects hot pixels and small noise clumps by requiring "
+                             "at least --npixels connected pixels. 'dao' correlates "
+                             "against a Gaussian PSF instead, and is kept for "
+                             "comparison")
+    parser.add_argument("--npixels", type=int, default=DEFAULT_NPIXELS,
+                        help="smallest connected area in pixels a segmentation "
+                             "detection may have (--detect-method segment only)")
+    parser.add_argument("--no-deblend", action="store_true",
+                        help="do not deblend merged segments (--detect-method segment "
+                             "only). Deblending is what keeps a fiber sitting inside "
+                             "diffuse scattered light from being absorbed into the "
+                             "glow's segment; it is free on a clean frame but costs "
+                             "seconds on one with hundreds of segments")
     parser.add_argument("--annulus-bkg", action="store_true",
                         help="estimate the background from a local annulus instead of "
                              "the sigma-clipped whole frame")
@@ -748,12 +1006,17 @@ def measure_frame(image_path, args, show=False):
         example `tifffile.TiffFileError` for an unreadable frame, `ValueError`
         for one that is not 2D, or `RuntimeError` if no source is detected. The
         caller decides whether that ends the run.
+
+    See Also
+    --------
+    locate_source : detection, selected by --detect-method.
     """
     data = load_image(image_path, plane=args.plane)
     stats = frame_stats(data)
 
     position = locate_source(data, fwhm_guess=args.fwhm_guess, nsigma=args.nsigma,
-                             stats=stats)
+                             stats=stats, method=args.detect_method,
+                             npixels=args.npixels, deblend=not args.no_deblend)
     fwhm = measure_fwhm(data, position, stats[0], fwhm_guess=args.fwhm_guess)
     radius = args.radius if args.radius is not None else args.k_fwhm * fwhm
 
@@ -775,7 +1038,8 @@ def measure_frame(image_path, args, show=False):
     )
 
     print(f"\nfile        : {image_path}")
-    print(f"centroid    : ({position[0]:.2f}, {position[1]:.2f}) px")
+    print(f"centroid    : ({position[0]:.2f}, {position[1]:.2f}) px "
+          f"[{args.detect_method}]")
     print(f"FWHM        : {fwhm:.2f} px")
     print(f"aperture    : r = {radius:.2f} px  (area {result['area']:.1f} px^2)")
     print(f"background  : {bkg_median:.3f} +/- {bkg_std:.3f} counts/px "
@@ -799,6 +1063,7 @@ def measure_frame(image_path, args, show=False):
         "y": f"{position[1]:.3f}",
         "fwhm_pix": f"{fwhm:.3f}",
         "radius_pix": f"{radius:.3f}",
+        "detect_method": args.detect_method,
         "bkg_method": bkg_method,
         "bkg_median": f"{bkg_median:.4f}",
         "bkg_std": f"{bkg_std:.4f}",
