@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """Aperture photometry for a single fiber output in MAST fiberhead images.
 
-Locates the one bright spot in a TIFF frame, measures its FWHM, subtracts a
+Locates the one bright spot in a TIFF or FITS frame, measures its FWHM, subtracts a
 background estimated either globally or from a local annulus, and integrates the
 counts inside a circular aperture whose radius is scaled to the measured FWHM.
 
 The spot is found by segmentation: the brightest group of connected pixels above
-the detection threshold that covers at least --npixels pixels. Requiring an area
-is what keeps hot pixels and small noise clumps from being taken for the fiber on
-a faint frame. --detect-method dao selects PSF-correlation detection instead.
+the detection threshold that covers at least --npixels pixels, discarding any
+group whose counts sit almost entirely in one pixel. Requiring an area is what
+keeps small noise clumps from being taken for the fiber on a faint frame, and the
+concentration cut is what rejects hot pixels and cosmic rays, which the area cut
+cannot because detection runs on a convolved frame. --detect-method dao selects
+PSF-correlation detection instead.
 
 Outputs a row in a CSV table of measurements (see --outfile), a summary printed
 to stdout, and a two-panel diagnostic figure (annotated cutout + curve of growth)
 written to `plots/`. The figures are throwaway sanity checks, so their location
 is fixed and untracked; --no-plot skips them entirely.
 
+Printing is controlled by two independent switches. --verbose adds the running
+notes the measurement makes about itself - how a stack was reduced, how many
+detections were found, which were discarded as spikes - and is off by default.
+--quiet drops the summary and the batch progress lines. Neither silences a
+warning about a degraded or unreliable result, nor an error. The library
+functions take the same two as `verbose` and `print_output`, both defaulting to
+False, so a notebook call is silent unless it has something to warn about.
+
 Any number of frames can be measured in one invocation, given as files, as
-directories (whose top-level TIFFs are measured), or as a text file listing
+directories (whose top-level images are measured), or as a text file listing
 either of those one per line. Batching this way is worth it: the astropy and
 photutils imports cost ~0.6 s and are paid once per invocation rather than once
 per frame.
@@ -24,6 +35,7 @@ per frame.
 Examples
 --------
     python aperture_photometry_single.py data/run01/frame_001.tif
+    python aperture_photometry_single.py data/run01/frame_001.fits
     python aperture_photometry_single.py data/run01/
     python aperture_photometry_single.py frames_to_measure.txt
 
@@ -55,6 +67,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 from astropy.convolution import Gaussian2DKernel, convolve
+from astropy.io import fits
 from astropy.nddata import Cutout2D
 from astropy.stats import SigmaClip
 from photutils.aperture import (
@@ -63,7 +76,6 @@ from photutils.aperture import (
     CircularAperture,
     aperture_photometry,
 )
-from photutils.centroids import centroid_quadratic, centroid_sources
 from photutils.detection import DAOStarFinder, find_peaks
 from photutils.profiles import CurveOfGrowth, RadialProfile
 from photutils.segmentation import (
@@ -77,11 +89,16 @@ from photutils.utils import calc_total_error
 # Detector properties of the fiberhead test camera.
 GAIN_E_PER_ADU = 1.0
 READ_NOISE_E = 0.46
-SATURATION_ADU = 1023  # 10-bit sensor
+# Digital saturation level. The 10-bit sensor's nominal maximum code is 1023,
+# but its output rails one count below that: saturated frames in
+# data/real_data_sample have flat tops of 100+ pixels at exactly 1022 and no
+# pixel anywhere at 1023. Counting saturation from 1023 therefore reports none
+# at all on a frame whose core is fully clipped.
+SATURATION_ADU = 1022  # 10-bit sensor, observed rail
 
 # Measurement defaults.
 DEFAULT_FWHM_GUESS = 11.0  # pixels
-DEFAULT_K_FWHM = 2.5  # aperture radius in units of the measured FWHM
+DEFAULT_K_FWHM = 2.2  # aperture radius in units of the measured FWHM
 ANNULUS_IN_FWHM = 4.0
 ANNULUS_OUT_FWHM = 7.0
 DEFAULT_NSIGMA = 5.0
@@ -95,10 +112,22 @@ DEFAULT_NPIXELS = 25  # smallest connected area a segmentation detection may hav
 # here keeps the detection threshold from collapsing to the background level.
 DIGITIZATION_SIGMA = 1.0 / np.sqrt(12.0)
 
+# Largest share of a detection's counts that may sit in its single brightest
+# pixel. Detection runs on a convolved frame, where one hot pixel is smeared into
+# a blob hundreds of pixels wide, so the --npixels area cut cannot reject it; this
+# does, by asking how concentrated the detection is in the unsmoothed data. A
+# Gaussian source of FWHM f puts a fraction of about 0.88 / f^2 of its counts in
+# the peak pixel - 0.007 for the ~11 px fiber output - while an isolated spike
+# puts all of them there. Set tight enough to also reject a source as narrow as
+# 3 px FWHM (fraction ~0.1), so a source has to be several pixels across to pass.
+SPIKE_PEAK_FRACTION = 0.1
+
 DETECT_METHODS = ("segment", "dao")
 DEFAULT_DETECT_METHOD = "segment"
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
+FITS_SUFFIXES = {".fits", ".fit", ".fts"}
+IMAGE_SUFFIXES = TIFF_SUFFIXES | FITS_SUFFIXES
 
 # Output locations. Diagnostic figures are throwaway sanity checks, so they
 # always land in PLOT_DIR rather than anywhere the user chooses.
@@ -151,9 +180,9 @@ RESULT_COLUMNS = [
 def expand_input(entry, allow_list=True):
     """Expand one command-line entry into the frames it refers to.
 
-    An entry may be a TIFF file, a directory (whose top-level TIFFs are taken,
-    sorted by name, without recursing), or a text file listing files and
-    directories one per line. Blank lines and lines starting with `#` are ignored
+    An entry may be an image file (TIFF or FITS), a directory (whose top-level
+    images are taken, sorted by name, without recursing), or a text file listing
+    files and directories one per line. Blank lines and lines starting with `#` are ignored
     in a list file, and relative paths in it are resolved against the directory
     the list itself lives in.
 
@@ -162,7 +191,7 @@ def expand_input(entry, allow_list=True):
     entry : str or pathlib.Path
         The path to expand.
     allow_list : bool, optional
-        Whether a non-TIFF file may be read as a list of paths. Set False when
+        Whether a non-image file may be read as a list of paths. Set False when
         expanding the contents of a list file, so lists cannot nest.
 
     Returns
@@ -175,7 +204,7 @@ def expand_input(entry, allow_list=True):
     FileNotFoundError
         If the entry does not exist.
     ValueError
-        If a directory holds no TIFFs, or a list file is referenced from inside
+        If a directory holds no images, or a list file is referenced from inside
         another list file.
     """
     path = Path(entry)
@@ -186,18 +215,19 @@ def expand_input(entry, allow_list=True):
 
     if path.is_dir():
         frames = sorted(p for p in path.iterdir()
-                        if p.is_file() and p.suffix.lower() in TIFF_SUFFIXES)
+                        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
         if not frames:
-            msg = (f"directory {path} contains no TIFF files (looked for "
-                   f"{', '.join(sorted(TIFF_SUFFIXES))} at the top level only)")
+            msg = (f"directory {path} contains no image files (looked for "
+                   f"{', '.join(sorted(IMAGE_SUFFIXES))} at the top level only)")
             raise ValueError(msg)
         return frames
 
-    if path.suffix.lower() in TIFF_SUFFIXES:
+    if path.suffix.lower() in IMAGE_SUFFIXES:
         return [path]
 
     if not allow_list:
-        msg = f"{path} is not a TIFF or a directory, and list files cannot nest"
+        msg = (f"{path} is not a TIFF, a FITS file or a directory, and list "
+               f"files cannot nest")
         raise ValueError(msg)
 
     frames = []
@@ -251,18 +281,23 @@ def gather_frames(entries):
     return frames
 
 
-def load_image(path, plane=0):
-    """Read a TIFF frame as a 2D float array.
+def load_image(path, plane=0, verbose=False):
+    """Read a TIFF or FITS frame as a 2D float array.
 
-    Multi-page stacks are reduced by selecting a single page; RGB(A) images are
+    The format is chosen from the file suffix: `.fits`, `.fit` and `.fts` are
+    read with astropy from the primary HDU, which is where the fiberhead camera
+    writes its image, and everything else is read with tifffile. Multi-page or
+    multi-plane stacks are reduced by selecting a single plane; RGB(A) images are
     reduced by averaging the colour channels.
 
     Parameters
     ----------
     path : str or pathlib.Path
-        Path to the TIFF file.
+        Path to the image file.
     plane : int, optional
-        Page to select from a multi-page stack. Ignored for 2D and RGB(A) input.
+        Plane to select from a stack. Ignored for 2D and RGB(A) input.
+    verbose : bool, optional
+        If True, report how a stack or an RGB(A) image was reduced to 2D.
 
     Returns
     -------
@@ -274,27 +309,36 @@ def load_image(path, plane=0):
     ValueError
         If the file does not reduce to a 2D image, or `plane` is out of range.
     """
-    raw = tifffile.imread(str(path))
+    path = Path(path)
+
+    if path.suffix.lower() in FITS_SUFFIXES:
+        raw = np.asarray(fits.getdata(str(path), 0))
+        kind = "FITS"
+    else:
+        raw = tifffile.imread(str(path))
+        kind = "TIFF"
 
     if raw.ndim == 2:
         image = raw
-    elif raw.ndim == 3 and raw.shape[-1] in (3, 4):
+    elif raw.ndim == 3 and kind == "TIFF" and raw.shape[-1] in (3, 4):
         image = raw[..., :3].mean(axis=-1)
-        print(f"[load] RGB(A) TIFF {raw.shape} -> averaged colour channels")
+        if verbose:
+            print(f"[load] RGB(A) TIFF {raw.shape} -> averaged colour channels")
     elif raw.ndim == 3:
         if not 0 <= plane < raw.shape[0]:
-            msg = f"plane {plane} out of range for a stack of {raw.shape[0]} pages"
+            msg = f"plane {plane} out of range for a stack of {raw.shape[0]} planes"
             raise ValueError(msg)
         image = raw[plane]
-        print(f"[load] multi-page TIFF {raw.shape} -> using page {plane}")
+        if verbose:
+            print(f"[load] multi-plane {kind} {raw.shape} -> using plane {plane}")
     else:
-        msg = f"cannot reduce a TIFF of shape {raw.shape} to a 2D image"
+        msg = f"cannot reduce a {kind} image of shape {raw.shape} to a 2D image"
         raise ValueError(msg)
 
     return np.asarray(image, dtype=np.float64)
 
 
-def frame_stats(data):
+def frame_stats(data, verbose=False):
     """Return sigma-clipped statistics for the whole frame.
 
     Computed once per frame and reused for the detection threshold, the profile
@@ -314,6 +358,8 @@ def frame_stats(data):
     ----------
     data : numpy.ndarray
         Two-dimensional image.
+    verbose : bool, optional
+        If True, report when the scatter is raised to the digitization floor.
 
     Returns
     -------
@@ -329,7 +375,7 @@ def frame_stats(data):
         # Only worth reporting when the clip has actually lost the noise tail. A
         # frame whose scatter merely rounds down to just under the floor is not
         # telling the reader anything.
-        if std < 0.9 * DIGITIZATION_SIGMA:
+        if verbose and std < 0.9 * DIGITIZATION_SIGMA:
             print(f"[stats] sigma-clipped scatter is {std:.3f} counts/px, below the "
                   f"digitization floor; using {DIGITIZATION_SIGMA:.3f} instead")
         std = DIGITIZATION_SIGMA
@@ -338,7 +384,8 @@ def frame_stats(data):
 
 
 def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
-                   nsigma=DEFAULT_NSIGMA, npixels=DEFAULT_NPIXELS, deblend=True):
+                   nsigma=DEFAULT_NSIGMA, npixels=DEFAULT_NPIXELS, deblend=True,
+                   reject_spikes=True, verbose=False):
     """Find the brightest source by image segmentation.
 
     The frame is background-subtracted and convolved with a Gaussian kernel
@@ -347,9 +394,14 @@ def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
     pixels. The brightest segment by total flux is taken as the source.
 
     Requiring a minimum connected area is what makes this robust on faint frames:
-    a fiber output is an extended blob, so single-pixel spikes and two- or
-    three-pixel noise clumps are rejected structurally rather than incidentally,
-    as they are by DAOStarFinder's PSF-correlation and sharpness cuts.
+    a fiber output is an extended blob, so noise clumps of a few pixels are
+    rejected structurally rather than incidentally, as they are by DAOStarFinder's
+    PSF-correlation and sharpness cuts. The area cut does not reject a single hot
+    pixel, though. Segmentation runs on the convolved frame, and convolution
+    smears one bright spike into a blob as wide as the kernel: an 877-count hot
+    pixel in data/real_data_sample survives an npixels of 25 as a ~100-pixel
+    segment. Such detections are removed instead by `SPIKE_PEAK_FRACTION`, which
+    asks how concentrated each detection is in the unsmoothed data.
 
     Deblending splits segments that merge several peaks. It matters whenever the
     frame carries diffuse scattered light: without it, a bright fiber sitting
@@ -373,12 +425,17 @@ def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
     deblend : bool, optional
         Whether to deblend merged segments. Costs seconds on a frame with
         hundreds of segments and nothing on a clean one.
+    reject_spikes : bool, optional
+        Whether to discard detections whose counts are concentrated in a single
+        pixel, i.e. hot pixels and cosmic rays. See `SPIKE_PEAK_FRACTION`.
+    verbose : bool, optional
+        If True, report which detections were discarded as spikes.
 
     Returns
     -------
     tuple or None
-        ((x, y), n_segments) for the brightest segment, or None if nothing was
-        detected.
+        ((x, y), n_segments) for the brightest segment, where `n_segments` counts
+        only the segments kept, or None if nothing was detected.
     """
     kernel_size = 2 * int(np.ceil(fwhm_guess)) + 1
     convolved = convolve(data - median, make_2dgaussian_kernel(fwhm_guess, kernel_size))
@@ -392,16 +449,33 @@ def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
 
     catalog = SourceCatalog(data - median, segments, convolved_data=convolved)
     flux = np.asarray(catalog.segment_flux, dtype=float)
-    if not np.isfinite(flux).any():
+    peak = np.asarray(catalog.max_value, dtype=float)
+    keep = np.isfinite(flux)
+
+    if reject_spikes:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            peak_fraction = np.where(flux > 0, peak / flux, np.inf)
+        spikes = keep & (peak_fraction > SPIKE_PEAK_FRACTION)
+        if spikes.any():
+            keep = keep & ~spikes
+            if verbose:
+                where = ", ".join(f"({float(catalog.x_centroid[i]):.0f}, "
+                                  f"{float(catalog.y_centroid[i]):.0f})"
+                                  for i in np.flatnonzero(spikes))
+                print(f"[detect] ignored {int(spikes.sum())} single-pixel spike(s) "
+                      f"at {where}; a hot pixel or cosmic ray survives the --npixels "
+                      "cut because detection runs on the convolved frame")
+
+    if not keep.any():
         return None
 
-    brightest = int(np.nanargmax(flux))
+    brightest = int(np.flatnonzero(keep)[np.argmax(flux[keep])])
     position = (float(catalog.x_centroid[brightest]),
                 float(catalog.y_centroid[brightest]))
     if not np.isfinite(position).all():
         return None
 
-    return position, segments.n_labels
+    return position, int(keep.sum())
 
 
 def detect_dao(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
@@ -481,12 +555,21 @@ def detect_peak(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
 
 def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
                   stats=None, method=DEFAULT_DETECT_METHOD,
-                  npixels=DEFAULT_NPIXELS, deblend=True):
-    """Find the brightest source in the frame and return a refined centroid.
+                  npixels=DEFAULT_NPIXELS, deblend=True, reject_spikes=True,
+                  verbose=False):
+    """Find the brightest source in the frame and return its position.
 
     Detection uses image segmentation or DAOStarFinder as selected by `method`,
     falling back to the brightest peak of a smoothed copy if that finds nothing.
-    The chosen position is then refined with a quadratic centroid fit.
+    The detected position is returned as it stands.
+
+    There is deliberately no sub-pixel refinement on top of it. The aperture
+    radius is several times the source FWHM, so the enclosed counts are
+    insensitive to where the aperture sits to well within a pixel, and the
+    detection position - a flux-weighted segment centroid, for the default
+    method - is already good to about 0.2 px. A quadratic centroid fit used to
+    run here and bought nothing, while failing outright on a saturated core,
+    whose flat top gives the fit no single peak to sit on.
 
     Parameters
     ----------
@@ -505,11 +588,17 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
         the `dao` method.
     deblend : bool, optional
         Whether to deblend merged segments. Ignored by the `dao` method.
+    reject_spikes : bool, optional
+        Whether to discard hot pixels and cosmic rays. Ignored by the `dao`
+        method.
+    verbose : bool, optional
+        If True, report how many detections were found. A message about a
+        degraded result - the detection fallback - is printed either way.
 
     Returns
     -------
     tuple of float
-        The (x, y) pixel position of the source.
+        The (x, y) pixel position of the source, from detection alone.
 
     Raises
     ------
@@ -526,7 +615,8 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
 
     if method == "segment":
         found = detect_segment(data, median, std, fwhm_guess=fwhm_guess,
-                               nsigma=nsigma, npixels=npixels, deblend=deblend)
+                               nsigma=nsigma, npixels=npixels, deblend=deblend,
+                               reject_spikes=reject_spikes, verbose=verbose)
         noun = "segments"
     else:
         found = detect_dao(data, median, std, fwhm_guess=fwhm_guess, nsigma=nsigma)
@@ -534,7 +624,7 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
 
     if found is not None:
         (xpeak, ypeak), n_found = found
-        if n_found > 1:
+        if verbose and n_found > 1:
             print(f"[detect] {n_found} {noun} found; using the brightest at "
                   f"({xpeak:.1f}, {ypeak:.1f})")
     else:
@@ -550,20 +640,7 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
         print(f"[detect] the {method} method found nothing; fell back to a smoothed "
               "peak search")
 
-    # `fit_boxsize` has to be passed explicitly: centroid_sources cuts out a
-    # box_size region and then calls centroid_quadratic on it with that keyword
-    # left at its default of 5, which fits a 5x5 quadratic to a spot several
-    # times wider and lands about a pixel off.
-    box = max(5, int(2 * round(fwhm_guess / 2)) + 1)
-    xcen, ycen = centroid_sources(data, xpeak, ypeak, box_size=box,
-                                  centroid_func=centroid_quadratic,
-                                  fit_boxsize=box)
-
-    if not np.isfinite([xcen, ycen]).all():
-        print("[detect] quadratic centroid failed; using the detection position")
-        return xpeak, ypeak
-
-    return float(xcen[0]), float(ycen[0])
+    return xpeak, ypeak
 
 
 def measure_fwhm(data, position, background, fwhm_guess=DEFAULT_FWHM_GUESS):
@@ -959,12 +1036,13 @@ def parse_args(argv=None):
         Parsed arguments.
     """
     parser = argparse.ArgumentParser(
-        description="Aperture photometry of a single fiber output in TIFF frames.",
+        description="Aperture photometry of a single fiber output in TIFF or FITS frames.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("inputs", nargs="+", metavar="INPUT",
-                        help="TIFF frames, directories whose top-level TIFFs are "
-                             "measured, or a text file listing either one per line")
+                        help="TIFF or FITS frames, directories whose top-level "
+                             "images are measured, or a text file listing either one "
+                             "per line")
     parser.add_argument("--fwhm-guess", type=float, default=DEFAULT_FWHM_GUESS,
                         help="approximate source FWHM in pixels, used for detection")
     parser.add_argument("--k-fwhm", type=float, default=DEFAULT_K_FWHM,
@@ -991,6 +1069,13 @@ def parse_args(argv=None):
                              "diffuse scattered light from being absorbed into the "
                              "glow's segment; it is free on a clean frame but costs "
                              "seconds on one with hundreds of segments")
+    parser.add_argument("--keep-spikes", action="store_true",
+                        help="do not discard detections whose counts sit almost "
+                             "entirely in one pixel (--detect-method segment only). "
+                             "Such detections are hot pixels or cosmic rays, which "
+                             "the --npixels area cut cannot reject because detection "
+                             "runs on the convolved frame; keep them to see the raw "
+                             "segment count")
     parser.add_argument("--annulus-bkg", action="store_true",
                         help="estimate the background from a local annulus instead of "
                              "the sigma-clipped whole frame")
@@ -998,12 +1083,20 @@ def parse_args(argv=None):
                         help="inner annulus radius in units of the measured FWHM")
     parser.add_argument("--r-out", type=float, default=ANNULUS_OUT_FWHM,
                         help="outer annulus radius in units of the measured FWHM")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="print the diagnostic notes the measurement makes along "
+                             "the way: how a stack was reduced, how many detections "
+                             "were found, which were discarded as spikes. Notes about "
+                             "a degraded or unreliable result are printed either way")
+    parser.add_argument("--quiet", action="store_true",
+                        help="do not print the per-frame summary or the batch "
+                             "progress lines. Warnings and errors are still printed")
     parser.add_argument("--gain", type=float, default=GAIN_E_PER_ADU,
                         help="detector gain in e-/ADU")
     parser.add_argument("--read-noise", type=float, default=READ_NOISE_E,
                         help="RMS read noise in e-")
     parser.add_argument("--plane", type=int, default=0,
-                        help="page to use from a multi-page TIFF")
+                        help="plane to use from a multi-plane TIFF or FITS stack")
     parser.add_argument("--outfile", type=Path, default=DEFAULT_OUTFILE,
                         help=f"CSV file to write. A value with a directory component "
                              f"is used as given (--outfile runs/run01.csv, --outfile "
@@ -1031,9 +1124,10 @@ def parse_args(argv=None):
 def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
                          k_fwhm=DEFAULT_K_FWHM, radius=None, nsigma=DEFAULT_NSIGMA,
                          detect_method=DEFAULT_DETECT_METHOD, npixels=DEFAULT_NPIXELS,
-                         deblend=True, annulus_bkg=False, r_in=ANNULUS_IN_FWHM,
+                         deblend=True, reject_spikes=True, annulus_bkg=False, r_in=ANNULUS_IN_FWHM,
                          r_out=ANNULUS_OUT_FWHM, gain=GAIN_E_PER_ADU,
-                         read_noise_e=READ_NOISE_E, plot=False, verbose=False):
+                         read_noise_e=READ_NOISE_E, plot=False, verbose=False,
+                         print_output=False):
     """Measure one already-loaded frame and return the result as numbers.
 
     This is the whole measurement in one call, and the only definition of it:
@@ -1066,6 +1160,9 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
         Smallest connected area a segmentation detection may have.
     deblend : bool, optional
         Whether to deblend segments before picking the brightest.
+    reject_spikes : bool, optional
+        Whether to discard hot pixels and cosmic rays before picking the
+        brightest detection.
     annulus_bkg : bool, optional
         If True, estimate the background from a local annulus rather than from
         the whole frame.
@@ -1080,7 +1177,13 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
         key. Nothing is written to disk and the figure is left open, so a
         notebook's inline backend renders it when the cell finishes.
     verbose : bool, optional
-        If True, print the same summary the command line prints.
+        If True, print the diagnostic notes the measurement makes along the way:
+        how a stack was reduced, how many detections were found, which were
+        discarded as spikes. Messages about a degraded or unreliable result are
+        printed either way.
+    print_output : bool, optional
+        If True, print the same summary of the headline numbers the command line
+        prints. Off by default, since a notebook has the returned dict.
 
     Returns
     -------
@@ -1109,10 +1212,11 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
         msg = f"expected a 2D image, got an array of shape {data.shape}"
         raise ValueError(msg)
 
-    stats = frame_stats(data)
+    stats = frame_stats(data, verbose=verbose)
 
     position = locate_source(data, fwhm_guess=fwhm_guess, nsigma=nsigma, stats=stats,
-                             method=detect_method, npixels=npixels, deblend=deblend)
+                             method=detect_method, npixels=npixels, deblend=deblend,
+                             reject_spikes=reject_spikes, verbose=verbose)
     fwhm = measure_fwhm(data, position, stats[0], fwhm_guess=fwhm_guess)
     aperture_radius = radius if radius is not None else k_fwhm * fwhm
 
@@ -1156,8 +1260,16 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
         "annulus": annulus,
     }
 
-    if verbose:
+    if print_output:
         report_measurement(result)
+
+    # Saturation is a property of the data, not a running commentary on the
+    # measurement, so it is reported whatever the printing flags say: the counts
+    # it qualifies are wrong in a way no other line of output reveals.
+    if result["n_saturated"] > 0:
+        print(f"WARNING: {result['n_saturated']} saturated pixels "
+              f"(>= {SATURATION_ADU} counts) inside the aperture - the measured "
+              "counts are a lower limit.")
 
     if plot:
         result["figure"] = make_figure(
@@ -1171,8 +1283,10 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
 def report_measurement(result):
     """Print the headline numbers of a measurement to stdout.
 
-    Kept out of `measure_single_image` so that the command line and a verbose notebook
-    call print the same thing from one definition.
+    Kept out of `measure_single_image` so that the command line and a notebook call
+    print the same thing from one definition. The saturation warning is not part of
+    it: that is a data-quality warning, printed by `measure_single_image` whether or
+    not this summary is.
 
     Parameters
     ----------
@@ -1196,14 +1310,9 @@ def report_measurement(result):
     print(f"counts      : {result['net_counts']:.4e} +/- {result['counts_err']:.2e} "
           f"(SNR {result['snr']:.1f})")
 
-    if result["n_saturated"] > 0:
-        print(f"WARNING: {result['n_saturated']} saturated pixels "
-              f"(>= {SATURATION_ADU} counts) inside the aperture - the measured "
-              "counts are a lower limit.")
 
-
-def measure_images(images, plane=0, plot=False, verbose=False, on_error="raise",
-                   **params):
+def measure_images(images, plane=0, plot=False, verbose=False, print_output=False,
+                   on_error="raise", **params):
     """Measure a list of frames and return the results as a DataFrame.
 
     The notebook counterpart of the command line: the same measurement, no files
@@ -1218,13 +1327,17 @@ def measure_images(images, plane=0, plot=False, verbose=False, on_error="raise",
         dispatched on its own type. A single array or a single path is accepted
         as a one-element list. Paths are read with `load_image`.
     plane : int, optional
-        Page to select from multi-page TIFFs. Applies to path inputs only.
+        Plane to select from a multi-plane stack. Applies to path inputs only.
     plot : bool, optional
         If True, build a diagnostic figure per frame. The figures are left open
         rather than saved, so a notebook's inline backend renders them when the
         cell finishes; they are not part of the returned table.
     verbose : bool, optional
-        If True, print the summary for each frame.
+        If True, print the diagnostic notes each measurement makes along the way.
+        Messages about a degraded or unreliable result are printed either way.
+    print_output : bool, optional
+        If True, print the summary of the headline numbers for each frame. Off by
+        default, since the returned table has them.
     on_error : {'raise', 'skip'}, optional
         What to do when a frame fails. 'raise', the default, propagates the
         exception, on the grounds that a row silently missing from a notebook
@@ -1274,9 +1387,11 @@ def measure_images(images, plane=0, plot=False, verbose=False, on_error="raise",
         name = str(image) if is_path else f"image_{index}"
 
         try:
-            data = load_image(image, plane=plane) if is_path else image
+            data = (load_image(image, plane=plane, verbose=verbose)
+                    if is_path else image)
             rows.append(measure_single_image(data, name=name, plot=plot,
-                                             verbose=verbose, **params))
+                                             verbose=verbose,
+                                             print_output=print_output, **params))
         except Exception as exc:  # noqa: BLE001 - the policy is the caller's
             if on_error == "raise":
                 raise
@@ -1329,7 +1444,7 @@ def measure_frame(image_path, args, show=False):
     Parameters
     ----------
     image_path : pathlib.Path
-        The TIFF frame to measure.
+        The TIFF or FITS frame to measure.
     args : argparse.Namespace
         Parsed command-line options.
     show : bool, optional
@@ -1353,14 +1468,16 @@ def measure_frame(image_path, args, show=False):
     measure_single_image : the measurement itself, for callers that are not the CLI.
     locate_source : detection, selected by --detect-method.
     """
-    data = load_image(image_path, plane=args.plane)
+    data = load_image(image_path, plane=args.plane, verbose=args.verbose)
 
     result = measure_single_image(
         data, name=str(image_path), fwhm_guess=args.fwhm_guess, k_fwhm=args.k_fwhm,
         radius=args.radius, nsigma=args.nsigma, detect_method=args.detect_method,
         npixels=args.npixels, deblend=not args.no_deblend,
+        reject_spikes=not args.keep_spikes,
         annulus_bkg=args.annulus_bkg, r_in=args.r_in, r_out=args.r_out,
-        gain=args.gain, read_noise_e=args.read_noise, verbose=True,
+        gain=args.gain, read_noise_e=args.read_noise, verbose=args.verbose,
+        print_output=not args.quiet,
     )
 
     if not args.no_plot:
@@ -1368,7 +1485,8 @@ def measure_frame(image_path, args, show=False):
         make_figure(data, (result["x"], result["y"]), result["aperture"],
                     result["fwhm_pix"], result["bkg_median"], figure_path,
                     annulus=result["annulus"], show=show)
-        print(f"figure      : {figure_path}")
+        if not args.quiet:
+            print(f"figure      : {figure_path}")
 
     return csv_row(result)
 
@@ -1407,7 +1525,7 @@ def main(argv=None):
         import matplotlib
         matplotlib.use("Agg")
 
-    if len(frames) > 1:
+    if len(frames) > 1 and not args.quiet:
         print(f"measuring {len(frames)} frames")
 
     rows = []
@@ -1424,9 +1542,10 @@ def main(argv=None):
         csv_path, n_removed = update_csv(resolve_outfile(args.outfile), rows)
         removed = f" (removed {n_removed} superseded row"
         removed += "s)" if n_removed > 1 else ")"
-        print(f"\ncsv         : {csv_path}{removed if n_removed else ''}")
+        if not args.quiet:
+            print(f"\ncsv         : {csv_path}{removed if n_removed else ''}")
 
-    if len(frames) > 1 or failures:
+    if (len(frames) > 1 or failures) and not args.quiet:
         print(f"measured {len(rows)}/{len(frames)} frames"
               + (f", {len(failures)} failed" if failures else ""))
 
