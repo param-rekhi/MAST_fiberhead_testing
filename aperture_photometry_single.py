@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """Aperture photometry for a single fiber output in MAST fiberhead images.
 
-Locates the one bright spot in a TIFF or FITS frame, measures its FWHM, subtracts a
-background estimated either globally or from a local annulus, and integrates the
-counts inside a circular aperture whose radius is scaled to the measured FWHM.
+Locates the one bright spot in a TIFF or FITS frame, subtracts a background
+estimated either globally or from a local annulus, and integrates the counts
+inside a circular aperture of fixed radius.
+
+The radius is fixed (--radius) rather than scaled to the source width. The camera
+and optics are the same for every frame, so the fraction of the light enclosed at
+a given radius is the same too, and a fixed aperture is what makes the fluxes
+directly comparable. A measured width, by contrast, drifts with source brightness
+- the profile's wings clear the noise floor on a bright frame and sink into it on
+a faint one - so scaling the radius by one would fold that drift into the flux and
+make it look like a throughput trend. --k-fwhm restores the scaled behaviour for
+comparison.
 
 The spot is found by segmentation: the brightest group of connected pixels above
 the detection threshold that covers at least --npixels pixels, discarding any
@@ -49,7 +58,7 @@ There is no package, so the repo root has to be on `sys.path`:
     from aperture_photometry_single import measure_images, measure_single_image
 
     df = measure_images(my_arrays)              # list of 2D arrays
-    df = measure_images(paths, k_fwhm=3.0)      # or a list of paths
+    df = measure_images(paths, radius=30.0)     # or a list of paths
     res = measure_single_image(arr, plot=True)  # one frame, with a figure
 
 `measure_images` returns a pandas DataFrame of numbers, not the CSV's formatted
@@ -77,7 +86,7 @@ from photutils.aperture import (
     aperture_photometry,
 )
 from photutils.detection import DAOStarFinder, find_peaks
-from photutils.profiles import CurveOfGrowth, RadialProfile
+from photutils.profiles import CurveOfGrowth
 from photutils.segmentation import (
     SourceCatalog,
     deblend_sources,
@@ -85,6 +94,7 @@ from photutils.segmentation import (
     make_2dgaussian_kernel,
 )
 from photutils.utils import calc_total_error
+from scipy import ndimage
 
 # Detector properties of the fiberhead test camera.
 GAIN_E_PER_ADU = 1.0
@@ -98,7 +108,13 @@ SATURATION_ADU = 1022  # 10-bit sensor, observed rail
 
 # Measurement defaults.
 DEFAULT_FWHM_GUESS = 11.0  # pixels
-DEFAULT_K_FWHM = 2.2  # aperture radius in units of the measured FWHM
+# Fixed extraction radius, in pixels. Set from the curve of growth of a stack of
+# real frames, which is flat from well inside this radius out past it: far enough
+# to enclose the wings, near enough that the background noise the aperture admits
+# (going as its area) stays small. Being on the flat part also makes the flux
+# insensitive to where the aperture sits, which is what lets the centroid be
+# measured once and reused across a run.
+DEFAULT_RADIUS = 36.0
 ANNULUS_IN_FWHM = 4.0
 ANNULUS_OUT_FWHM = 7.0
 DEFAULT_NSIGMA = 5.0
@@ -142,7 +158,7 @@ CSV_COLUMNS = [
     "radius_pix",
     "detect_method",
     "bkg_method",
-    "bkg_median",
+    "bkg_level",
     "bkg_std",
     "net_counts",
     "counts_err",
@@ -163,7 +179,7 @@ RESULT_COLUMNS = [
     "radius_pix",
     "detect_method",
     "bkg_method",
-    "bkg_median",
+    "bkg_level",
     "bkg_std",
     "n_bkg_pix",
     "net_counts",
@@ -345,6 +361,15 @@ def frame_stats(data, verbose=False):
     background and (unless a local annulus is requested) the background
     subtraction itself, since clipping a 1440x1080 frame is not free.
 
+    The level is the clipped *mean*, not the median. The background of a 10-bit
+    frame occupies only a couple of adjacent ADU codes, and the median of so
+    coarsely quantized a distribution snaps to whichever code holds the majority
+    - it can only ever return an integer. On the sample frames that rounds 2.73
+    counts up to exactly 3.00, and over-subtracting 0.27 counts from every pixel
+    drains the curve of growth by several percent at the extraction radius, an
+    error that grows as the aperture's area. The mean of the same clipped pixels
+    carries the fractional part and does not.
+
     The scatter is floored at `DIGITIZATION_SIGMA`. On a faint frame sitting at
     one or two counts, the pixel distribution is a spike at the background with a
     sparse tail one count above it, and sigma clipping discards that tail - the
@@ -364,12 +389,12 @@ def frame_stats(data, verbose=False):
     Returns
     -------
     tuple
-        (median, std, n_pixels) of the sigma-clipped frame, where `std` is not
-        less than `DIGITIZATION_SIGMA` and `n_pixels` is the number of pixels
-        surviving the clip.
+        (level, std, n_pixels) of the sigma-clipped frame, where `level` is the
+        clipped mean, `std` is not less than `DIGITIZATION_SIGMA` and `n_pixels`
+        is the number of pixels surviving the clip.
     """
     clipped = SigmaClip(sigma=SIGMA_CLIP)(data.ravel(), masked=True)
-    median, std = float(np.ma.median(clipped)), float(np.ma.std(clipped))
+    level, std = float(np.ma.mean(clipped)), float(np.ma.std(clipped))
 
     if std < DIGITIZATION_SIGMA:
         # Only worth reporting when the clip has actually lost the noise tail. A
@@ -380,10 +405,10 @@ def frame_stats(data, verbose=False):
                   f"digitization floor; using {DIGITIZATION_SIGMA:.3f} instead")
         std = DIGITIZATION_SIGMA
 
-    return median, std, int(clipped.count())
+    return level, std, int(clipped.count())
 
 
-def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
+def detect_segment(data, level, std, fwhm_guess=DEFAULT_FWHM_GUESS,
                    nsigma=DEFAULT_NSIGMA, npixels=DEFAULT_NPIXELS, deblend=True,
                    reject_spikes=True, verbose=False):
     """Find the brightest source by image segmentation.
@@ -412,7 +437,7 @@ def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
     ----------
     data : numpy.ndarray
         Two-dimensional image.
-    median : float
+    level : float
         Background level to subtract before detection.
     std : float
         Per-pixel background scatter that `nsigma` is measured in.
@@ -438,7 +463,7 @@ def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
         only the segments kept, or None if nothing was detected.
     """
     kernel_size = 2 * int(np.ceil(fwhm_guess)) + 1
-    convolved = convolve(data - median, make_2dgaussian_kernel(fwhm_guess, kernel_size))
+    convolved = convolve(data - level, make_2dgaussian_kernel(fwhm_guess, kernel_size))
 
     segments = detect_sources(convolved, nsigma * std, n_pixels=npixels)
     if segments is None:
@@ -447,7 +472,7 @@ def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
     if deblend:
         segments = deblend_sources(convolved, segments, npixels, progress_bar=False)
 
-    catalog = SourceCatalog(data - median, segments, convolved_data=convolved)
+    catalog = SourceCatalog(data - level, segments, convolved_data=convolved)
     flux = np.asarray(catalog.segment_flux, dtype=float)
     peak = np.asarray(catalog.max_value, dtype=float)
     keep = np.isfinite(flux)
@@ -478,7 +503,7 @@ def detect_segment(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
     return position, int(keep.sum())
 
 
-def detect_dao(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
+def detect_dao(data, level, std, fwhm_guess=DEFAULT_FWHM_GUESS,
                nsigma=DEFAULT_NSIGMA):
     """Find the brightest source with DAOStarFinder.
 
@@ -491,7 +516,7 @@ def detect_dao(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
     ----------
     data : numpy.ndarray
         Two-dimensional image.
-    median : float
+    level : float
         Background level to subtract before detection.
     std : float
         Per-pixel background scatter that `nsigma` is measured in.
@@ -506,7 +531,7 @@ def detect_dao(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
         ((x, y), n_sources) for the brightest detection, or None if nothing was
         found.
     """
-    sources = DAOStarFinder(threshold=nsigma * std, fwhm=fwhm_guess)(data - median)
+    sources = DAOStarFinder(threshold=nsigma * std, fwhm=fwhm_guess)(data - level)
     if sources is None or len(sources) == 0:
         return None
 
@@ -516,7 +541,7 @@ def detect_dao(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
     return position, len(sources)
 
 
-def detect_peak(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
+def detect_peak(data, level, std, fwhm_guess=DEFAULT_FWHM_GUESS,
                 nsigma=DEFAULT_NSIGMA):
     """Find the brightest peak of a smoothed frame.
 
@@ -528,7 +553,7 @@ def detect_peak(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
     ----------
     data : numpy.ndarray
         Two-dimensional image.
-    median : float
+    level : float
         Background level to subtract before the peak search.
     std : float
         Per-pixel background scatter that `nsigma` is measured in.
@@ -544,7 +569,7 @@ def detect_peak(data, median, std, fwhm_guess=DEFAULT_FWHM_GUESS,
         the threshold.
     """
     kernel = Gaussian2DKernel(x_stddev=fwhm_guess / 2.355)
-    smoothed = convolve(data - median, kernel)
+    smoothed = convolve(data - level, kernel)
 
     peaks = find_peaks(smoothed, threshold=nsigma * std, n_peaks=1)
     if peaks is None or len(peaks) == 0:
@@ -611,15 +636,15 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
         msg = f"unknown detection method {method!r}; expected one of {DETECT_METHODS}"
         raise ValueError(msg)
 
-    median, std, _ = stats if stats is not None else frame_stats(data)
+    level, std, _ = stats if stats is not None else frame_stats(data)
 
     if method == "segment":
-        found = detect_segment(data, median, std, fwhm_guess=fwhm_guess,
+        found = detect_segment(data, level, std, fwhm_guess=fwhm_guess,
                                nsigma=nsigma, npixels=npixels, deblend=deblend,
                                reject_spikes=reject_spikes, verbose=verbose)
         noun = "segments"
     else:
-        found = detect_dao(data, median, std, fwhm_guess=fwhm_guess, nsigma=nsigma)
+        found = detect_dao(data, level, std, fwhm_guess=fwhm_guess, nsigma=nsigma)
         noun = "sources"
 
     if found is not None:
@@ -628,7 +653,7 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
             print(f"[detect] {n_found} {noun} found; using the brightest at "
                   f"({xpeak:.1f}, {ypeak:.1f})")
     else:
-        fallback = detect_peak(data, median, std, fwhm_guess=fwhm_guess, nsigma=nsigma)
+        fallback = detect_peak(data, level, std, fwhm_guess=fwhm_guess, nsigma=nsigma)
         if fallback is None:
             msg = (
                 f"no source detected: the {method} method and the peak search both "
@@ -644,7 +669,34 @@ def locate_source(data, fwhm_guess=DEFAULT_FWHM_GUESS, nsigma=DEFAULT_NSIGMA,
 
 
 def measure_fwhm(data, position, background, fwhm_guess=DEFAULT_FWHM_GUESS):
-    """Measure the source FWHM from a Gaussian fit to its radial profile.
+    """Measure the source FWHM from the area of its half-maximum footprint.
+
+    The width is read off the number of pixels standing above half the peak, as
+    `2 * sqrt(N / pi)` - the diameter of the circle of that area - rather than
+    from a fitted model.
+
+    Fitting a Gaussian, the obvious alternative, measures the wrong thing here. A
+    fiber output is a near-field disc convolved with the PSF: flat-topped,
+    steep-shouldered, and carrying more light in its wings than a Gaussian has.
+    On a stack of real frames the profile stands 0.12 above the best-fit Gaussian
+    at r = 4 px, dips 0.05 below it at r = 6, and runs above it again from r = 10
+    outwards - structure, not scatter. A fit to a shape it cannot represent
+    settles on a compromise between core and wings, and the balance of that
+    compromise moves with how much of the wing clears the noise floor, so the
+    fitted width drifts with source brightness even though the optics never
+    change. Counting area assumes nothing about the shape, is steadier frame to
+    frame (0.09 px against 0.11 px on frames of equal brightness), and costs a
+    threshold and a sum instead of a least-squares fit that can fail to converge.
+
+    Only the connected footprint containing the centroid is counted, and the
+    reference peak is taken from a 3x3 median of the cutout. Every real frame from
+    this camera has hot pixels; they stand far above half maximum, and each one
+    would otherwise both inflate the count and, if bright enough, set the
+    half-maximum level itself. The source core is flat over far more than 3 px, so
+    the median filter leaves it alone.
+
+    This is a diagnostic, not an input to the photometry. The extraction radius is
+    fixed precisely so that the flux does not depend on a measured width.
 
     Parameters
     ----------
@@ -653,30 +705,41 @@ def measure_fwhm(data, position, background, fwhm_guess=DEFAULT_FWHM_GUESS):
     position : tuple of float
         The (x, y) source centroid.
     background : float
-        Background level to subtract before profiling.
+        Background level to subtract before thresholding.
     fwhm_guess : float, optional
-        Approximate FWHM in pixels; sets the profile extent and is returned as a
-        fallback if the fit fails.
+        Approximate FWHM in pixels; sets the size of the search box and is
+        returned as a fallback if no footprint can be measured.
 
     Returns
     -------
     float
         Measured FWHM in pixels.
     """
-    radii = np.arange(0.0, 4.0 * fwhm_guess, 1.0)
+    half_size = int(np.ceil(2.0 * fwhm_guess))
+    xc, yc = int(round(position[0])), int(round(position[1]))
+    y0, y1 = max(yc - half_size, 0), min(yc + half_size + 1, data.shape[0])
+    x0, x1 = max(xc - half_size, 0), min(xc + half_size + 1, data.shape[1])
+    cutout = data[y0:y1, x0:x1] - background
 
-    try:
-        profile = RadialProfile(data - background, position, radii)
-        fwhm = float(profile.gaussian_fwhm)
-    except Exception as exc:  # noqa: BLE001 - any fit failure falls back to the guess
-        print(f"[fwhm] radial profile fit failed ({exc}); using --fwhm-guess instead")
+    peak = float(ndimage.median_filter(cutout, size=3).max())
+    if not np.isfinite(peak) or peak <= 0.0:
+        print("[fwhm] no positive peak above the background; using --fwhm-guess instead")
         return fwhm_guess
 
-    if not np.isfinite(fwhm) or fwhm <= 0 or fwhm > 4.0 * fwhm_guess:
-        print(f"[fwhm] implausible fitted FWHM ({fwhm:.2f} px); using --fwhm-guess instead")
+    labels, _ = ndimage.label(cutout >= 0.5 * peak)
+    at_source = int(labels[yc - y0, xc - x0])
+    if at_source == 0:
+        print("[fwhm] the centroid does not sit inside the half-maximum footprint; "
+              "using --fwhm-guess instead")
         return fwhm_guess
 
-    return fwhm
+    footprint = labels == at_source
+    if (footprint[0, :].any() or footprint[-1, :].any()
+            or footprint[:, 0].any() or footprint[:, -1].any()):
+        print("[fwhm] the half-maximum footprint reaches the edge of the search box; "
+              "the width is a lower limit - raise --fwhm-guess")
+
+    return 2.0 * np.sqrt(int(np.count_nonzero(footprint)) / np.pi)
 
 
 def estimate_background_global(data, stats=None):
@@ -695,8 +758,9 @@ def estimate_background_global(data, stats=None):
     Returns
     -------
     tuple
-        (median, std, n_pixels) of the sigma-clipped background, where
-        `n_pixels` is the number of pixels surviving the clip.
+        (level, std, n_pixels) of the sigma-clipped background, where `level` is
+        the clipped mean and `n_pixels` is the number of pixels surviving the
+        clip.
     """
     return stats if stats is not None else frame_stats(data)
 
@@ -719,7 +783,8 @@ def estimate_background_annulus(data, position, r_in, r_out):
     Returns
     -------
     tuple
-        (median, std, n_pixels) of the sigma-clipped annulus pixels.
+        (level, std, n_pixels) of the sigma-clipped annulus pixels, where
+        `level` is the clipped mean.
     """
     annulus = CircularAnnulus(position, r_in=r_in, r_out=r_out)
 
@@ -732,10 +797,10 @@ def estimate_background_annulus(data, position, r_in, r_out):
 
     stats = ApertureStats(data, annulus, sigma_clip=SigmaClip(sigma=SIGMA_CLIP))
     n_pix = int(np.ma.count(stats.data_cutout))
-    return float(stats.median), float(stats.std), n_pix
+    return float(stats.mean), float(stats.std), n_pix
 
 
-def measure_counts(data, position, radius, bkg_median, bkg_std, n_bkg_pix,
+def measure_counts(data, position, radius, bkg_level, bkg_std, n_bkg_pix,
                    gain=GAIN_E_PER_ADU, read_noise_e=READ_NOISE_E):
     """Integrate background-subtracted counts in a circular aperture.
 
@@ -753,7 +818,7 @@ def measure_counts(data, position, radius, bkg_median, bkg_std, n_bkg_pix,
         The (x, y) source centroid.
     radius : float
         Aperture radius in pixels.
-    bkg_median : float
+    bkg_level : float
         Background level per pixel, in counts.
     bkg_std : float
         Per-pixel background standard deviation, in counts.
@@ -771,7 +836,7 @@ def measure_counts(data, position, radius, bkg_median, bkg_std, n_bkg_pix,
         `sigma_pix`, `area`.
     """
     aperture = CircularAperture(position, r=radius)
-    subtracted = data - bkg_median
+    subtracted = data - bkg_level
 
     sigma_pix = max(bkg_std, read_noise_e / gain)
     error = calc_total_error(subtracted, np.full_like(subtracted, sigma_pix), gain)
@@ -836,7 +901,7 @@ def display_limits(values):
     return float(vmin), float(vmax)
 
 
-def make_figure(data, position, aperture, fwhm, bkg_median, out_path=None, annulus=None,
+def make_figure(data, position, aperture, fwhm, bkg_level, out_path=None, annulus=None,
                 show=True, close=True):
     """Build the cutout and curve-of-growth diagnostic figure.
 
@@ -855,7 +920,7 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path=None, annul
         The measurement aperture.
     fwhm : float
         Measured source FWHM in pixels; drawn as a circle of radius FWHM / 2.
-    bkg_median : float
+    bkg_level : float
         Background level per pixel, subtracted before building the growth curve.
     out_path : pathlib.Path, optional
         Destination for the PNG. If None the figure is not written to disk, which
@@ -914,7 +979,7 @@ def make_figure(data, position, aperture, fwhm, bkg_median, out_path=None, annul
     ax_img.legend(loc="upper right", fontsize=8, framealpha=0.6)
 
     radii = np.linspace(1.0, 1.5 * radius, 60)
-    cog = CurveOfGrowth(data - bkg_median, position, radii)
+    cog = CurveOfGrowth(data - bkg_level, position, radii)
     ax_cog.plot(cog.radius, cog.profile, color="k", lw=1.2)
     ax_cog.axvline(radius, color="crimson", ls="--", lw=1.2, label=f"r = {radius:.1f} px")
     ax_cog.axvline(hwhm, color="deepskyblue", ls=":", lw=1.2, label=f"HWHM = {hwhm:.1f} px")
@@ -1045,10 +1110,23 @@ def parse_args(argv=None):
                              "per line")
     parser.add_argument("--fwhm-guess", type=float, default=DEFAULT_FWHM_GUESS,
                         help="approximate source FWHM in pixels, used for detection")
-    parser.add_argument("--k-fwhm", type=float, default=DEFAULT_K_FWHM,
-                        help="aperture radius in units of the measured FWHM")
-    parser.add_argument("--radius", type=float, default=None,
-                        help="explicit aperture radius in pixels (overrides --k-fwhm)")
+    parser.add_argument("--radius", type=float, default=DEFAULT_RADIUS,
+                        help="fixed aperture radius in pixels")
+    parser.add_argument("--k-fwhm", type=float, default=None,
+                        help="scale the aperture radius to the measured FWHM by this "
+                             "factor instead of using --radius. Off by default, and "
+                             "best left off: the measured width drifts with source "
+                             "brightness, so an aperture scaled to it folds that "
+                             "drift into the flux. Kept for comparison")
+    parser.add_argument("--no-reuse-centroid", action="store_true",
+                        help="detect the source on every frame. By default it is "
+                             "detected once, on the first frame that succeeds, and "
+                             "every later frame is measured at that centroid: the "
+                             "fiberhead does not move, detection is ~470 ms of a "
+                             "~520 ms frame, and the aperture is large enough that a "
+                             "fraction of a pixel of misplacement does not move the "
+                             "flux. Frames measured at the inherited centroid record "
+                             "'reused' as their detect_method")
     parser.add_argument("--nsigma", type=float, default=DEFAULT_NSIGMA,
                         help="detection threshold in background sigma")
     parser.add_argument("--detect-method", choices=DETECT_METHODS,
@@ -1122,7 +1200,8 @@ def parse_args(argv=None):
 
 
 def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
-                         k_fwhm=DEFAULT_K_FWHM, radius=None, nsigma=DEFAULT_NSIGMA,
+                         radius=DEFAULT_RADIUS, k_fwhm=None, position=None,
+                         nsigma=DEFAULT_NSIGMA,
                          detect_method=DEFAULT_DETECT_METHOD, npixels=DEFAULT_NPIXELS,
                          deblend=True, reject_spikes=True, annulus_bkg=False, r_in=ANNULUS_IN_FWHM,
                          r_out=ANNULUS_OUT_FWHM, gain=GAIN_E_PER_ADU,
@@ -1146,12 +1225,21 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
     name : str, optional
         Label for this frame, passed through to the `name` field of the result.
     fwhm_guess : float, optional
-        Expected source FWHM in pixels, used to size the detection kernel and as
-        the fallback if the profile fit does not converge.
-    k_fwhm : float, optional
-        Aperture radius in units of the measured FWHM. Ignored if `radius` is given.
+        Expected source FWHM in pixels, used to size the detection kernel and the
+        FWHM search box, and returned as the fallback if the half-maximum
+        footprint cannot be measured.
     radius : float, optional
-        Explicit aperture radius in pixels, overriding the FWHM scaling.
+        Fixed aperture radius in pixels, used unless `k_fwhm` is given.
+    k_fwhm : float, optional
+        Aperture radius in units of the measured FWHM, overriding `radius`. Off by
+        default, and best left off: a width measured from the frame drifts with
+        source brightness, so scaling the aperture by one makes the flux depend on
+        how bright the source happened to be. Kept for comparison.
+    position : tuple of float, optional
+        Centroid (x, y) to measure at, skipping detection entirely. The fiberhead
+        does not move, so one centroid can serve a whole run; `measure_images` and
+        the command line do that for themselves, see `reuse_centroid`. A frame
+        measured this way reports `reused` as its `detect_method`.
     nsigma : float, optional
         Detection threshold in units of the background scatter.
     detect_method : {'segment', 'dao'}, optional
@@ -1189,7 +1277,8 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
     -------
     dict
         The measurement. The `RESULT_COLUMNS` keys - `name`, `x`, `y`,
-        `fwhm_pix`, `radius_pix`, `detect_method`, `bkg_method`, `bkg_median`,
+        `fwhm_pix`, `radius_pix`, `detect_method` (or `reused` when `position`
+        was supplied), `bkg_method`, `bkg_level`,
         `bkg_std`, `n_bkg_pix`, `net_counts`, `counts_err`, `snr`,
         `n_saturated`, `area`, `sigma_pix`, `gain`, `read_noise_e` - are all
         numbers or strings. Alongside them are the photutils objects the
@@ -1214,26 +1303,36 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
 
     stats = frame_stats(data, verbose=verbose)
 
-    position = locate_source(data, fwhm_guess=fwhm_guess, nsigma=nsigma, stats=stats,
-                             method=detect_method, npixels=npixels, deblend=deblend,
-                             reject_spikes=reject_spikes, verbose=verbose)
+    if position is None:
+        position = locate_source(data, fwhm_guess=fwhm_guess, nsigma=nsigma,
+                                 stats=stats, method=detect_method, npixels=npixels,
+                                 deblend=deblend, reject_spikes=reject_spikes,
+                                 verbose=verbose)
+        position_from = detect_method
+    else:
+        position = (float(position[0]), float(position[1]))
+        position_from = "reused"
+        if verbose:
+            print(f"[detect] measuring at the supplied centroid ({position[0]:.1f}, "
+                  f"{position[1]:.1f}); detection skipped")
+
     fwhm = measure_fwhm(data, position, stats[0], fwhm_guess=fwhm_guess)
-    aperture_radius = radius if radius is not None else k_fwhm * fwhm
+    aperture_radius = k_fwhm * fwhm if k_fwhm is not None else radius
 
     annulus = None
     if annulus_bkg:
         ann_in, ann_out = r_in * fwhm, r_out * fwhm
-        bkg_median, bkg_std, n_bkg_pix = estimate_background_annulus(
+        bkg_level, bkg_std, n_bkg_pix = estimate_background_annulus(
             data, position, ann_in, ann_out
         )
         annulus = CircularAnnulus(position, r_in=ann_in, r_out=ann_out)
         bkg_method = f"annulus[{ann_in:.1f}-{ann_out:.1f}]"
     else:
-        bkg_median, bkg_std, n_bkg_pix = estimate_background_global(data, stats=stats)
+        bkg_level, bkg_std, n_bkg_pix = estimate_background_global(data, stats=stats)
         bkg_method = "global"
 
     counts = measure_counts(
-        data, position, aperture_radius, bkg_median, bkg_std, n_bkg_pix,
+        data, position, aperture_radius, bkg_level, bkg_std, n_bkg_pix,
         gain=gain, read_noise_e=read_noise_e,
     )
 
@@ -1243,9 +1342,9 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
         "y": float(position[1]),
         "fwhm_pix": float(fwhm),
         "radius_pix": float(aperture_radius),
-        "detect_method": detect_method,
+        "detect_method": position_from,
         "bkg_method": bkg_method,
-        "bkg_median": float(bkg_median),
+        "bkg_level": float(bkg_level),
         "bkg_std": float(bkg_std),
         "n_bkg_pix": int(n_bkg_pix),
         "net_counts": counts["net_counts"],
@@ -1273,7 +1372,7 @@ def measure_single_image(data, name=None, fwhm_guess=DEFAULT_FWHM_GUESS,
 
     if plot:
         result["figure"] = make_figure(
-            data, position, counts["aperture"], fwhm, bkg_median,
+            data, position, counts["aperture"], fwhm, bkg_level,
             annulus=annulus, show=False, close=False,
         )
 
@@ -1305,14 +1404,14 @@ def report_measurement(result):
     print(f"FWHM        : {result['fwhm_pix']:.2f} px")
     print(f"aperture    : r = {result['radius_pix']:.2f} px  "
           f"(area {result['area']:.1f} px^2)")
-    print(f"background  : {result['bkg_median']:.3f} +/- {result['bkg_std']:.3f} "
+    print(f"background  : {result['bkg_level']:.3f} +/- {result['bkg_std']:.3f} "
           f"counts/px [{result['bkg_method']}, {result['n_bkg_pix']} px]")
     print(f"counts      : {result['net_counts']:.4e} +/- {result['counts_err']:.2e} "
           f"(SNR {result['snr']:.1f})")
 
 
 def measure_images(images, plane=0, plot=False, verbose=False, print_output=False,
-                   on_error="skip", **params):
+                   on_error="skip", reuse_centroid=True, **params):
     """Measure a list of frames and return the results as a DataFrame.
 
     The notebook counterpart of the command line: the same measurement, no files
@@ -1338,6 +1437,17 @@ def measure_images(images, plane=0, plot=False, verbose=False, print_output=Fals
     print_output : bool, optional
         If True, print the summary of the headline numbers for each frame. Off by
         default, since the returned table has them.
+    reuse_centroid : bool, optional
+        If True, the default, detect the source on the first frame that succeeds
+        and measure every later frame at that same centroid. The fiberhead is
+        fixed, so the spot does not move, and detection is by far the most
+        expensive step of a measurement - around 470 ms of a ~520 ms frame. The
+        extraction radius sits on the flat part of the curve of growth, where the
+        enclosed flux barely responds to a fraction of a pixel of misplacement, so
+        nothing is given up by not re-finding it. Frames measured at the inherited
+        centroid report `reused` as their `detect_method`, so the table shows
+        which row the position came from. Pass False to detect on every frame; an
+        explicit `position` overrides this either way.
     on_error : {'raise', 'skip'}, optional
         What to do when a frame fails. 'skip', the default, reports the failure
         on stderr and still appends a row for it, with every column NaN except
@@ -1345,9 +1455,9 @@ def measure_images(images, plane=0, plot=False, verbose=False, print_output=Fals
         with their inputs. 'raise' propagates the exception instead.
     **params
         Forwarded to `measure_single_image`, so every measurement option is available
-        by keyword: `fwhm_guess`, `k_fwhm`, `radius`, `nsigma`, `detect_method`,
-        `npixels`, `deblend`, `annulus_bkg`, `r_in`, `r_out`, `gain`,
-        `read_noise_e`.
+        by keyword: `fwhm_guess`, `radius`, `k_fwhm`, `position`, `nsigma`,
+        `detect_method`, `npixels`, `deblend`, `annulus_bkg`, `r_in`, `r_out`,
+        `gain`, `read_noise_e`.
 
     Returns
     -------
@@ -1366,7 +1476,7 @@ def measure_images(images, plane=0, plot=False, verbose=False, print_output=Fals
     Examples
     --------
     >>> df = measure_images(my_arrays)                             # doctest: +SKIP
-    >>> df = measure_images(paths, k_fwhm=3.0, annulus_bkg=True)   # doctest: +SKIP
+    >>> df = measure_images(paths, radius=30.0, annulus_bkg=True)  # doctest: +SKIP
     """
     # pandas is as expensive to import as astropy and the command line never
     # needs it, so it is imported here rather than at module scope.
@@ -1382,6 +1492,11 @@ def measure_images(images, plane=0, plot=False, verbose=False, print_output=Fals
         images = [images]
 
     rows = []
+    # Held across the loop so the source is detected once and inherited from
+    # there. A frame that fails leaves it unset, so the next frame detects again
+    # rather than the whole run going undetected because the first frame was bad.
+    inherited = None
+
     for index, image in enumerate(images):
         is_path = isinstance(image, (str, Path))
         name = str(image) if is_path else f"image_{index}"
@@ -1389,9 +1504,15 @@ def measure_images(images, plane=0, plot=False, verbose=False, print_output=Fals
         try:
             data = (load_image(image, plane=plane, verbose=verbose)
                     if is_path else image)
-            rows.append(measure_single_image(data, name=name, plot=plot,
-                                             verbose=verbose,
-                                             print_output=print_output, **params))
+            frame_params = dict(params)
+            if reuse_centroid and inherited is not None:
+                frame_params.setdefault("position", inherited)
+            result = measure_single_image(data, name=name, plot=plot,
+                                          verbose=verbose,
+                                          print_output=print_output, **frame_params)
+            rows.append(result)
+            if reuse_centroid and inherited is None:
+                inherited = (result["x"], result["y"])
         except Exception as exc:  # noqa: BLE001 - the policy is the caller's
             if on_error == "raise":
                 raise
@@ -1425,7 +1546,7 @@ def csv_row(result):
         "radius_pix": f"{result['radius_pix']:.3f}",
         "detect_method": result["detect_method"],
         "bkg_method": result["bkg_method"],
-        "bkg_median": f"{result['bkg_median']:.4f}",
+        "bkg_level": f"{result['bkg_level']:.4f}",
         "bkg_std": f"{result['bkg_std']:.4f}",
         "net_counts": f"{result['net_counts']:.6e}",
         "counts_err": f"{result['counts_err']:.6e}",
@@ -1436,7 +1557,7 @@ def csv_row(result):
     }
 
 
-def measure_frame(image_path, args, show=False):
+def measure_frame(image_path, args, show=False, position=None):
     """Measure one frame from disk and report the result to stdout.
 
     The command-line adapter around `measure_single_image`: it reads the file, unpacks
@@ -1451,11 +1572,17 @@ def measure_frame(image_path, args, show=False):
         Parsed command-line options.
     show : bool, optional
         If True, open an interactive figure window for this frame.
+    position : tuple of float, optional
+        Centroid (x, y) to measure at, skipping detection. `main` passes the
+        centroid found on the first frame of a batch unless --no-reuse-centroid.
 
     Returns
     -------
-    dict
-        A CSV row of the measurement, keyed by the names in `CSV_COLUMNS`.
+    tuple
+        The CSV row of the measurement, keyed by the names in `CSV_COLUMNS`, and
+        the (x, y) centroid it was measured at, as numbers. The centroid is
+        returned separately because the row holds it as a formatted string, and
+        `main` needs it back as a number to pass to the rest of the batch.
 
     Raises
     ------
@@ -1473,8 +1600,9 @@ def measure_frame(image_path, args, show=False):
     data = load_image(image_path, plane=args.plane, verbose=args.verbose)
 
     result = measure_single_image(
-        data, name=str(image_path), fwhm_guess=args.fwhm_guess, k_fwhm=args.k_fwhm,
-        radius=args.radius, nsigma=args.nsigma, detect_method=args.detect_method,
+        data, name=str(image_path), fwhm_guess=args.fwhm_guess,
+        radius=args.radius, k_fwhm=args.k_fwhm, position=position,
+        nsigma=args.nsigma, detect_method=args.detect_method,
         npixels=args.npixels, deblend=not args.no_deblend,
         reject_spikes=not args.keep_spikes,
         annulus_bkg=args.annulus_bkg, r_in=args.r_in, r_out=args.r_out,
@@ -1485,12 +1613,12 @@ def measure_frame(image_path, args, show=False):
     if not args.no_plot:
         figure_path = PLOT_DIR / f"{image_path.stem}_aperture.png"
         make_figure(data, (result["x"], result["y"]), result["aperture"],
-                    result["fwhm_pix"], result["bkg_median"], figure_path,
+                    result["fwhm_pix"], result["bkg_level"], figure_path,
                     annulus=result["annulus"], show=show)
         if not args.quiet:
             print(f"figure      : {figure_path}")
 
-    return csv_row(result)
+    return csv_row(result), (result["x"], result["y"])
 
 
 def main(argv=None):
@@ -1533,10 +1661,17 @@ def main(argv=None):
 
     rows = []
     failures = []
+    # Detected on the first frame that succeeds and inherited by the rest of the
+    # batch, unless --no-reuse-centroid. A frame that fails leaves this unset, so
+    # the next one detects rather than the batch inheriting nothing.
+    inherited = None
 
     for frame in frames:
         try:
-            rows.append(measure_frame(frame, args, show=show))
+            row, position = measure_frame(frame, args, show=show, position=inherited)
+            rows.append(row)
+            if not args.no_reuse_centroid and inherited is None:
+                inherited = position
         except Exception as exc:  # noqa: BLE001 - one bad frame must not end the batch
             failures.append(frame)
             print(f"ERROR: {frame}: {exc.__class__.__name__}: {exc}", file=sys.stderr)
