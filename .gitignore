@@ -20,6 +20,9 @@ results/**
 # Throwaway diagnostic figures
 plots/
 
+# Scratch notebook
+fun.ipynb
+
 # Editor / OS
 .DS_Store
 *.swp
