@@ -1312,7 +1312,7 @@ def report_measurement(result):
 
 
 def measure_images(images, plane=0, plot=False, verbose=False, print_output=False,
-                   on_error="raise", **params):
+                   on_error="skip", **params):
     """Measure a list of frames and return the results as a DataFrame.
 
     The notebook counterpart of the command line: the same measurement, no files
@@ -1339,10 +1339,10 @@ def measure_images(images, plane=0, plot=False, verbose=False, print_output=Fals
         If True, print the summary of the headline numbers for each frame. Off by
         default, since the returned table has them.
     on_error : {'raise', 'skip'}, optional
-        What to do when a frame fails. 'raise', the default, propagates the
-        exception, on the grounds that a row silently missing from a notebook
-        table is worse than a traceback. 'skip' reports the failure on stderr
-        and omits the row, which is usually what a long batch wants.
+        What to do when a frame fails. 'skip', the default, reports the failure
+        on stderr and still appends a row for it, with every column NaN except
+        `name`, so a bad frame does not shift later rows out of correspondence
+        with their inputs. 'raise' propagates the exception instead.
     **params
         Forwarded to `measure_single_image`, so every measurement option is available
         by keyword: `fwhm_guess`, `k_fwhm`, `radius`, `nsigma`, `detect_method`,
@@ -1352,11 +1352,11 @@ def measure_images(images, plane=0, plot=False, verbose=False, print_output=Fals
     Returns
     -------
     pandas.DataFrame
-        One row per successfully measured frame, with the columns named in
-        `RESULT_COLUMNS`. The `name` column holds the path for path inputs and
-        `image_<index>` for array inputs. Empty input, or a batch in which every
-        frame failed under `on_error='skip'`, gives an empty DataFrame with
-        those columns.
+        One row per input frame, with the columns named in `RESULT_COLUMNS`. The
+        `name` column holds the path for path inputs and `image_<index>` for
+        array inputs. A frame that failed under `on_error='skip'` is present
+        with `name` set and every other column NaN. Empty input gives an empty
+        DataFrame with those columns.
 
     Raises
     ------
@@ -1396,6 +1396,8 @@ def measure_images(images, plane=0, plot=False, verbose=False, print_output=Fals
             if on_error == "raise":
                 raise
             print(f"ERROR: {name}: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+            rows.append({col: (name if col == "name" else np.nan)
+                        for col in RESULT_COLUMNS})
 
     # Selecting the columns explicitly drops the photutils objects and the
     # figure, which have no place in a table.
@@ -1494,10 +1496,11 @@ def measure_frame(image_path, args, show=False):
 def main(argv=None):
     """Measure every requested frame and write the results.
 
-    A frame that cannot be read or has no detectable source is reported and
-    skipped, so one bad file does not abandon a batch. The CSV named by --outfile
-    is written once, after all frames are measured; diagnostic figures go to
-    `PLOT_DIR`.
+    A frame that cannot be read or has no detectable source is reported on
+    stderr and given a placeholder CSV row - every column NaN except `filename`
+    - so one bad file does not abandon the batch or shift later rows out of
+    correspondence with their inputs. The CSV named by --outfile is written once,
+    after all frames are measured; diagnostic figures go to `PLOT_DIR`.
 
     Parameters
     ----------
@@ -1537,6 +1540,8 @@ def main(argv=None):
         except Exception as exc:  # noqa: BLE001 - one bad frame must not end the batch
             failures.append(frame)
             print(f"ERROR: {frame}: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+            rows.append({col: (str(frame) if col == "filename" else "nan")
+                        for col in CSV_COLUMNS})
 
     if rows and not args.no_csv:
         csv_path, n_removed = update_csv(resolve_outfile(args.outfile), rows)
@@ -1546,7 +1551,7 @@ def main(argv=None):
             print(f"\ncsv         : {csv_path}{removed if n_removed else ''}")
 
     if (len(frames) > 1 or failures) and not args.quiet:
-        print(f"measured {len(rows)}/{len(frames)} frames"
+        print(f"measured {len(rows) - len(failures)}/{len(frames)} frames"
               + (f", {len(failures)} failed" if failures else ""))
 
     return 1 if failures else 0
